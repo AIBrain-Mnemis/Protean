@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "type": "screen_state",
+  "id": "msg_0016",
+  "ts": 18.402,
+  "payload": {
+    "mode": "observe",
+    "source": "remote_screen",
+    "fps": 1.0,
+    "resolution": [1280, 720]
+  }
+}

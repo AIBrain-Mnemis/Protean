@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "type": "send_image",
+  "id": "msg_0014",
+  "ts": 60.220,
+  "payload": {
+    "mime": "image/jpeg",
+    "image_b64": "<base64 jpeg bytes elided>",
+    "caption": "Reference screenshot for the validation question."
+  }
+}

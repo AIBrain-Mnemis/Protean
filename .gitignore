@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+generated/
+
+# Tool caches
+.ruff_cache/
+.mypy_cache/
+
+# Temporary frame extraction
+protean-frames-*/
+rec-*/
+
+# Environment
+.env
+.env.local
+
+# Protean data (recordings, skills, etc.)
+data/
+tests/_evolve_dump/
+
+cua
+_cua_last_payload.json
+
+# Local-only patch notes (not in git)
+patch-notes/

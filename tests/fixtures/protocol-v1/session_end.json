@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "type": "session_end",
+  "id": "msg_0005",
+  "ts": 187.420,
+  "payload": {
+    "reason": "call-ended"
+  }
+}

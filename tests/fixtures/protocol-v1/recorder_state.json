@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "type": "recorder_state",
+  "id": "msg_0017",
+  "ts": 1.205,
+  "payload": {
+    "recording": true,
+    "recording_id": "rec-20260509-143217",
+    "output_dir": "/Users/example/recordings/rec-20260509-143217"
+  }
+}

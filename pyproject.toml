@@ -1,0 +1,82 @@
+[project]
+name = "protean"
+version = "0.1.0"
+description = "Protean — record user behavior, generate reusable skills via LLM"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "MIT" }
+authors = [
+    { name = "Mnemis Team" },
+]
+keywords = [
+    "llm", "agent", "desktop-automation", "skill", "computer-use",
+    "procedural-memory", "gui-automation",
+]
+
+dependencies = [
+    "pynput>=1.7",          # cross-platform keyboard/mouse monitoring
+    "Pillow>=10.0",         # image processing
+    "openai>=1.0",          # OpenAI SDK (also covers Doubao, Gemini via compat)
+    "anthropic>=0.30",      # Anthropic Claude SDK
+    "claude-agent-sdk>=0.1", # official Claude Agent SDK (powers ClaudeCodeExecutor)
+    "pydantic>=2.0",        # structured LLM output validation
+    "click>=8.0",           # CLI framework
+    "python-dotenv>=1.0",   # .env loading
+    "pyyaml>=6.0",          # YAML frontmatter for SKILL.md
+    "mcp>=1.26.0",
+    "websockets>=16.0",
+    "sounddevice>=0.5.5",
+    "numpy>=2.4.4",
+    # Windows-only (auto-installed on win32)
+    "pywin32>=306;          sys_platform == 'win32'",
+    "uiautomation>=2.0.20;  sys_platform == 'win32'",
+    # macOS-only (auto-installed on darwin)
+    "pyobjc-core>=10.0;                          sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=10.0;               sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=10.0;              sys_platform == 'darwin'",
+    "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+# Kept as back-compat shims for `uv sync --extra windows` / `--extra macos`.
+# The same packages are auto-installed via platform markers above.
+macos = [
+    "pyobjc-core>=10.0",
+    "pyobjc-framework-Cocoa>=10.0",
+    "pyobjc-framework-Quartz>=10.0",
+    "pyobjc-framework-ApplicationServices>=10.0",
+]
+windows = [
+    "pywin32>=306",         # Win32 API wrappers (window mgmt, clipboard, process)
+    "uiautomation>=2.0.20", # Microsoft UI Automation (accessibility tree)
+]
+video = [
+    "ffmpeg-python>=0.2",   # video recording/analysis via ffmpeg
+]
+[project.scripts]
+protean = "protean.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[tool.pyright]
+pythonVersion = "3.12"
+reportAttributeAccessIssue = "none"  # pyobjc exports symbols dynamically at runtime
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

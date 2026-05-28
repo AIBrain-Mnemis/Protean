@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "type": "error",
+  "id": "msg_0020",
+  "ts": 0,
+  "payload": {
+    "code": "unsupported_local_tool",
+    "message": "request_screenshot",
+    "in_reply_to": "msg_0003",
+    "fatal": false
+  }
+}

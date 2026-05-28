@@ -1,0 +1,44 @@
+{
+  "v": 1,
+  "type": "session_start",
+  "id": "msg_0003",
+  "ts": 0,
+  "payload": {
+    "realtime": {
+      "voice": "Puck",
+      "input_sample_rate": 16000,
+      "output_sample_rate": 24000,
+      "video_fps_limit": 2,
+      "system_instruction": "You are Protean, a voice-based desktop assistant.\nYou watch the user's screen, talk with them, and learn their tasks.\nYou coordinate but never operate the computer directly.\n\nKeep responses to one or two sentences. Speak like a colleague.\nRespond in the user's language.\nWhen the user describes their goal, call set_task.",
+      "tools": [
+        {
+          "name": "observe_step",
+          "handler": "python",
+          "description": "Record a step the user just demonstrated on screen.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "intent": {"type": "string", "description": "What this step achieves."},
+              "action": {"type": "string", "description": "How the step was performed."}
+            },
+            "required": ["intent", "action"]
+          }
+        },
+        {
+          "name": "start_screen",
+          "handler": "bridge",
+          "description": "Start screen handling in observe or share mode.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "mode": {"type": "string", "enum": ["observe", "share"]},
+              "display": {"type": "integer"}
+            },
+            "required": ["mode"]
+          }
+        }
+      ]
+    },
+    "accept_call_id": "trtc-room-2026-05-09-001"
+  }
+}

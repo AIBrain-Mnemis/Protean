@@ -1,0 +1,1909 @@
+"""macOS platform backend.
+
+Uses:
+- Quartz/CoreGraphics for window info, screenshots, screen recording
+- NSWorkspace for process/app info
+- CGEvent for input simulation
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Iterator
+from pathlib import Path
+
+from protean.platform.base import ClipboardContent, DisplayInfo, ElementInfo, Platform, WindowInfo
+
+log = logging.getLogger(__name__)
+
+
+def _extract_ax_point(val: object) -> tuple[float | None, float | None]:
+    """Extract (x, y) from an AXValueRef representing a CGPoint."""
+    import re
+
+    # Try AXValueGetValue first (may not be available in all PyObjC versions)
+    try:
+        from HIServices import AXValueGetValue, kAXValueTypeCGPoint
+
+        ok, point = AXValueGetValue(val, kAXValueTypeCGPoint, None)
+        if ok:
+            return (float(point.x), float(point.y))
+    except (ImportError, TypeError, AttributeError):
+        pass
+
+    # Fallback: parse from string representation
+    # Format: "<AXValue ...> {value = x:-216.000000 y:-674.000000 type = kAXValueCGPointType}"
+    try:
+        m = re.search(r"x:([-\d.]+)\s*y:([-\d.]+)", str(val))
+        if m:
+            return (float(m.group(1)), float(m.group(2)))
+    except (TypeError, ValueError):
+        pass
+
+    return (None, None)
+
+
+def _extract_ax_size(val: object) -> tuple[float | None, float | None]:
+    """Extract (width, height) from an AXValueRef representing a CGSize."""
+    import re
+
+    # Try AXValueGetValue first
+    try:
+        from HIServices import AXValueGetValue, kAXValueTypeCGSize
+
+        ok, size = AXValueGetValue(val, kAXValueTypeCGSize, None)
+        if ok:
+            return (float(size.width), float(size.height))
+    except (ImportError, TypeError, AttributeError):
+        pass
+
+    # Fallback: parse from string representation
+    # Format: "<AXValue ...> {value = w:511.000000 h:34.000000 type = kAXValueCGSizeType}"
+    try:
+        m = re.search(r"w:([-\d.]+)\s*h:([-\d.]+)", str(val))
+        if m:
+            return (float(m.group(1)), float(m.group(2)))
+    except (TypeError, ValueError):
+        pass
+
+    return (None, None)
+
+
+class MacOSPlatform(Platform):
+    """macOS implementation of the Platform protocol."""
+
+    def __init__(self) -> None:
+        self._recording_process: subprocess.Popen | None = None
+        self._recording_path: Path | None = None
+        self._audio_process: subprocess.Popen | None = None
+
+    @property
+    def name(self) -> str:
+        return "macos"
+
+    def _list_avfoundation_devices(self) -> str:
+        """Get ffmpeg avfoundation device list."""
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return result.stderr
+        except Exception:
+            return ""
+
+    def _find_audio_device(self) -> str | None:
+        """Find a suitable virtual audio device for recording app audio.
+
+        Checks avfoundation audio devices for known app audio sources.
+        Returns the device name, or None if no suitable device found.
+        """
+        devices = self._list_avfoundation_devices()
+
+        # Known app audio device patterns (order = priority)
+        # Each app that exposes a virtual audio device gets matched here.
+        known_patterns = [
+            "Microsoft Teams Audio",  # Teams
+            "ZoomAudioDevice",  # Zoom
+            "WebEx",  # Cisco WebEx
+            "Discord",  # Discord
+            "Slack",  # Slack
+            "BlackHole",  # Generic virtual audio (fallback)
+        ]
+        for pattern in known_patterns:
+            if pattern in devices:
+                return pattern
+        return None
+
+    # ── Window info ──────────────────────────────────────
+
+    def get_window_at_point(self, x: int, y: int) -> WindowInfo | None:
+        """Return the topmost window containing the given screen coordinates.
+
+        Uses CGWindowListCopyWindowInfo to hit-test *all* on-screen windows
+        (including menu-bar / accessory-policy apps like GlobalProtect that
+        NSWorkspace.activeApplication() ignores).  Windows are returned in
+        front-to-back z-order, so the first geometric hit is the topmost one.
+
+        Falls back to :meth:`get_active_window` when pyobjc is unavailable.
+        """
+        try:
+            from Quartz import (
+                CGWindowListCopyWindowInfo,
+                kCGNullWindowID,
+                kCGWindowListExcludeDesktopElements,
+                kCGWindowListOptionOnScreenOnly,
+            )
+        except ImportError:
+            return self.get_active_window()
+
+        options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
+        window_list = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+
+        for win in window_list:
+            bounds = win.get("kCGWindowBounds", {})
+            wx = int(bounds.get("X", 0))
+            wy = int(bounds.get("Y", 0))
+            ww = int(bounds.get("Width", 0))
+            wh = int(bounds.get("Height", 0))
+
+            # Skip tiny / zero-size windows (e.g. status-bar icons)
+            if ww < 2 or wh < 2:
+                continue
+
+            if wx <= x < wx + ww and wy <= y < wy + wh:
+                pid = win.get("kCGWindowOwnerPID", 0)
+                return WindowInfo(
+                    pid=pid,
+                    process_name=win.get("kCGWindowOwnerName", ""),
+                    window_title=win.get("kCGWindowName", ""),
+                    bundle_id=self._bundle_id_for_pid(pid),
+                    x=wx,
+                    y=wy,
+                    width=ww,
+                    height=wh,
+                )
+
+        # No geometric hit — fall back to the active-app method
+        return self.get_active_window()
+
+    @staticmethod
+    def _bundle_id_for_pid(pid: int) -> str:
+        """Return the bundle identifier for a given PID, or '' on failure."""
+        try:
+            from AppKit import NSRunningApplication
+            app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+            return app.bundleIdentifier() or "" if app else ""
+        except Exception:
+            return ""
+
+    def get_active_window(self) -> WindowInfo | None:
+        try:
+            from AppKit import NSWorkspace
+            from Quartz import (
+                CGWindowListCopyWindowInfo,
+                kCGNullWindowID,
+                kCGWindowListExcludeDesktopElements,
+                kCGWindowListOptionOnScreenOnly,
+            )
+        except ImportError:
+            return self._get_active_window_fallback()
+
+        active_app = NSWorkspace.sharedWorkspace().activeApplication()
+        if not active_app:
+            return None
+
+        pid = active_app["NSApplicationProcessIdentifier"]
+        app_name = active_app.get("NSApplicationName", "")
+        bundle_id = active_app.get("NSApplicationBundleIdentifier", "")
+
+        # Find the frontmost window for this pid (search all layers, not just 0)
+        options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
+        window_list = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+
+        for win in window_list:
+            if win.get("kCGWindowOwnerPID") == pid:
+                bounds = win.get("kCGWindowBounds", {})
+                ww = int(bounds.get("Width", 0))
+                wh = int(bounds.get("Height", 0))
+                # Skip tiny / zero-size windows
+                if ww < 2 or wh < 2:
+                    continue
+                return WindowInfo(
+                    pid=pid,
+                    process_name=app_name,
+                    window_title=win.get("kCGWindowName", ""),
+                    bundle_id=bundle_id,
+                    x=int(bounds.get("X", 0)),
+                    y=int(bounds.get("Y", 0)),
+                    width=ww,
+                    height=wh,
+                )
+
+        return WindowInfo(pid=pid, process_name=app_name, window_title="", bundle_id=bundle_id)
+
+    def _get_active_window_fallback(self) -> WindowInfo | None:
+        """Fallback using osascript when pyobjc is not installed."""
+        try:
+            result = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    'tell application "System Events" to get '
+                    "{name, unix id} of first process whose frontmost is true",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                parts = result.stdout.strip().split(", ")
+                if len(parts) >= 2:
+                    return WindowInfo(
+                        pid=int(parts[1]),
+                        process_name=parts[0],
+                        window_title="",
+                    )
+        except Exception:
+            pass
+        return None
+
+    def list_windows(self) -> list[WindowInfo]:
+        try:
+            from Quartz import (
+                CGWindowListCopyWindowInfo,
+                kCGNullWindowID,
+                kCGWindowListExcludeDesktopElements,
+                kCGWindowListOptionOnScreenOnly,
+            )
+        except ImportError:
+            return []
+
+        options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
+        window_list = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+        results = []
+        for win in window_list:
+            if win.get("kCGWindowLayer", 999) != 0:
+                continue
+            bounds = win.get("kCGWindowBounds", {})
+            results.append(
+                WindowInfo(
+                    pid=win.get("kCGWindowOwnerPID", 0),
+                    process_name=win.get("kCGWindowOwnerName", ""),
+                    window_title=win.get("kCGWindowName", ""),
+                    x=int(bounds.get("X", 0)),
+                    y=int(bounds.get("Y", 0)),
+                    width=int(bounds.get("Width", 0)),
+                    height=int(bounds.get("Height", 0)),
+                )
+            )
+        return results
+
+    def list_notifications(self) -> list[WindowInfo]:
+        """List notification/overlay windows (non-layer-0)."""
+        try:
+            from Quartz import (
+                CGWindowListCopyWindowInfo,
+                kCGNullWindowID,
+                kCGWindowListExcludeDesktopElements,
+                kCGWindowListOptionOnScreenOnly,
+            )
+        except ImportError:
+            return []
+
+        options = (
+            kCGWindowListOptionOnScreenOnly
+            | kCGWindowListExcludeDesktopElements
+        )
+        window_list = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+        results = []
+        for win in window_list:
+            layer = win.get("kCGWindowLayer", 0)
+            if layer <= 0:
+                continue
+            bounds = win.get("kCGWindowBounds", {})
+            results.append(
+                WindowInfo(
+                    pid=win.get("kCGWindowOwnerPID", 0),
+                    process_name=win.get("kCGWindowOwnerName", ""),
+                    window_title=win.get("kCGWindowName", ""),
+                    x=int(bounds.get("X", 0)),
+                    y=int(bounds.get("Y", 0)),
+                    width=int(bounds.get("Width", 0)),
+                    height=int(bounds.get("Height", 0)),
+                )
+            )
+        return results
+
+    # ── Display info ─────────────────────────────────────
+
+    def get_displays(self) -> list[DisplayInfo]:
+        try:
+            from Quartz import (
+                CGDisplayBounds,
+                CGDisplayPixelsWide,
+                CGGetActiveDisplayList,
+                CGMainDisplayID,
+            )
+
+            max_displays = 16
+            err, display_ids, count = CGGetActiveDisplayList(max_displays, None, None)
+            if err != 0:
+                return []
+            main_id = CGMainDisplayID()
+            results = []
+            for idx, did in enumerate(display_ids[:count], 1):
+                bounds = CGDisplayBounds(did)
+                logical_w = int(bounds.size.width)
+                pixel_w = CGDisplayPixelsWide(did)
+                scale = pixel_w / logical_w if logical_w > 0 else 1.0
+                results.append(
+                    DisplayInfo(
+                        display_id=did,
+                        display_index=idx,
+                        width=logical_w,
+                        height=int(bounds.size.height),
+                        origin_x=int(bounds.origin.x),
+                        origin_y=int(bounds.origin.y),
+                        scale_factor=scale,
+                        is_primary=(did == main_id),
+                    )
+                )
+            return results
+        except ImportError:
+            return [
+                DisplayInfo(display_id=0, display_index=1, width=1920, height=1080, is_primary=True)
+            ]
+
+    def get_cursor_position(self) -> tuple[int, int]:
+        try:
+            from Quartz import NSEvent
+
+            loc = NSEvent.mouseLocation()
+            # NSEvent gives bottom-left origin; convert to top-left
+            from Quartz import CGDisplayBounds, CGMainDisplayID
+
+            main_bounds = CGDisplayBounds(CGMainDisplayID())
+            return int(loc.x), int(main_bounds.size.height - loc.y)
+        except ImportError:
+            return 0, 0
+
+    # ── Screen recording ─────────────────────────────────
+    #
+    # Video: screencapture (-k for click markers)
+    # Audio: ffmpeg via avfoundation (auto-detects app audio device, e.g. "Microsoft Teams Audio")
+    # Merged after stop.
+
+    def start_screen_recording(
+        self,
+        output_path: Path,
+        display_index: int = 1,
+        *,
+        show_clicks: bool = True,
+        capture_audio: bool = False,
+    ) -> None:
+        if self._recording_process is not None:
+            raise RuntimeError("Recording already in progress")
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Video via screencapture (supports click markers)
+        cmd = ["screencapture", "-x", "-v", f"-D{display_index}"]
+        if show_clicks:
+            cmd.append("-k")
+        cmd.append(str(output_path))
+
+        self._recording_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self._recording_path = output_path
+        self._audio_process = None
+
+        # Audio via ffmpeg — auto-detect app audio device (e.g. "Microsoft Teams Audio")
+        if capture_audio:
+            audio_dev = self._find_audio_device()
+            if audio_dev:
+                audio_path = output_path.with_suffix(".audio.m4a")
+                self._audio_process = subprocess.Popen(
+                    [
+                        "ffmpeg",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-f",
+                        "avfoundation",
+                        "-i",
+                        f":{audio_dev}",
+                        "-acodec",
+                        "aac",
+                        str(audio_path),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+    def stop_screen_recording(self) -> Path | None:
+        if self._recording_process is None:
+            return None
+
+        # Stop video
+        self._recording_process.send_signal(signal.SIGINT)
+        try:
+            self._recording_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self._recording_process.kill()
+            self._recording_process.wait(timeout=5)
+
+        # Stop audio if running
+        if self._audio_process is not None:
+            self._audio_process.send_signal(signal.SIGINT)
+            try:
+                self._audio_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._audio_process.kill()
+            self._audio_process = None
+
+        path = self._recording_path
+        self._recording_process = None
+        self._recording_path = None
+
+        if not path or not path.exists() or path.stat().st_size == 0:
+            return None
+
+        # Merge audio into video if audio was recorded
+        audio_path = path.with_suffix(".audio.m4a")
+        if audio_path.exists() and audio_path.stat().st_size > 0:
+            merged_path = path.with_suffix(".merged.mov")
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(path),
+                    "-i",
+                    str(audio_path),
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                    str(merged_path),
+                ],
+                capture_output=True,
+                timeout=60,
+            )
+            if result.returncode == 0 and merged_path.exists():
+                merged_path.rename(path)
+            audio_path.unlink(missing_ok=True)
+
+        return path
+
+    def capture_display(self, display_index: int, output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            "screencapture", "-x",
+            "-D", str(display_index),
+        ]
+        # Let screencapture output JPEG directly when the path ends with .jpg/.jpeg
+        suffix = output_path.suffix.lower()
+        if suffix in (".jpg", ".jpeg"):
+            cmd.extend(["-t", "jpg"])
+        cmd.append(str(output_path))
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="ignore").strip()
+            raise RuntimeError(
+                f"screencapture failed: {stderr or result.returncode}"
+            )
+
+    # ── Power / session management ───────────────────────
+
+    @contextlib.contextmanager
+    def keep_awake(self) -> Iterator[None]:
+        """Hold a power assertion via `caffeinate -dimsu -w <pid>` for the
+        duration of the block.
+
+        The `-w <pid>` form makes caffeinate auto-exit when our process dies,
+        so we never leak the assertion. Falls back to a no-op if `caffeinate`
+        is missing from PATH.
+        """
+        if shutil.which("caffeinate") is None:
+            log.warning("caffeinate not found; keep-awake disabled on this host")
+            yield
+            return
+        proc: subprocess.Popen | None = None
+        try:
+            proc = subprocess.Popen(
+                ["caffeinate", "-dimsu", "-w", str(os.getpid())],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            log.debug("Keep-awake enabled (caffeinate pid=%s)", proc.pid)
+            yield
+        finally:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                except Exception:
+                    log.debug("Failed to terminate caffeinate", exc_info=True)
+
+    # ── Input simulation ─────────────────────────────────
+
+    def click(self, x: int, y: int, button: str = "left") -> None:
+        try:
+            from Quartz import (
+                CGEventCreateMouseEvent,
+                CGEventPost,
+                CGPointMake,
+                kCGEventLeftMouseDown,
+                kCGEventLeftMouseUp,
+                kCGEventRightMouseDown,
+                kCGEventRightMouseUp,
+                kCGHIDEventTap,
+                kCGMouseButtonLeft,
+                kCGMouseButtonRight,
+            )
+
+            point = CGPointMake(x, y)
+            if button == "right":
+                down = CGEventCreateMouseEvent(
+                    None, kCGEventRightMouseDown, point, kCGMouseButtonRight,
+                )
+                up = CGEventCreateMouseEvent(
+                    None, kCGEventRightMouseUp, point, kCGMouseButtonRight,
+                )
+            else:
+                down = CGEventCreateMouseEvent(
+                    None, kCGEventLeftMouseDown, point, kCGMouseButtonLeft,
+                )
+                up = CGEventCreateMouseEvent(
+                    None, kCGEventLeftMouseUp, point, kCGMouseButtonLeft,
+                )
+            CGEventPost(kCGHIDEventTap, down)
+            CGEventPost(kCGHIDEventTap, up)
+        except ImportError:
+            btn_flag = "rc" if button == "right" else "c"
+            subprocess.run(
+                ["osascript", "-e", f'do shell script "cliclick {btn_flag}:{x},{y}"'],
+                capture_output=True,
+            )
+
+    def double_click(self, x: int, y: int) -> None:
+        """Double-click at (x, y) using CGEvent with clickCount=2."""
+        try:
+            from Quartz import (
+                CGEventCreateMouseEvent,
+                CGEventPost,
+                CGEventSetIntegerValueField,
+                CGPointMake,
+                kCGEventLeftMouseDown,
+                kCGEventLeftMouseUp,
+                kCGHIDEventTap,
+                kCGMouseButtonLeft,
+                kCGMouseEventClickState,
+            )
+
+            point = CGPointMake(x, y)
+            # First click
+            down1 = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, point, kCGMouseButtonLeft)
+            CGEventSetIntegerValueField(down1, kCGMouseEventClickState, 1)
+            up1 = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, point, kCGMouseButtonLeft)
+            CGEventSetIntegerValueField(up1, kCGMouseEventClickState, 1)
+            # Second click
+            down2 = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, point, kCGMouseButtonLeft)
+            CGEventSetIntegerValueField(down2, kCGMouseEventClickState, 2)
+            up2 = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, point, kCGMouseButtonLeft)
+            CGEventSetIntegerValueField(up2, kCGMouseEventClickState, 2)
+            CGEventPost(kCGHIDEventTap, down1)
+            CGEventPost(kCGHIDEventTap, up1)
+            CGEventPost(kCGHIDEventTap, down2)
+            CGEventPost(kCGHIDEventTap, up2)
+        except ImportError:
+            subprocess.run(
+                ["osascript", "-e", f'do shell script "cliclick dc:{x},{y}"'],
+                capture_output=True,
+            )
+
+    def scroll(self, x: int, y: int, direction: str = "down", amount: int = 3) -> None:
+        """Scroll at (x, y). direction: up/down/left/right."""
+        # Move cursor to position first
+        self.move_cursor(x, y)
+        try:
+            from Quartz import (
+                CGEventCreateScrollWheelEvent,
+                CGEventPost,
+                kCGHIDEventTap,
+                kCGScrollEventUnitLine,
+            )
+
+            dy, dx = 0, 0
+            if direction == "down":
+                dy = -amount
+            elif direction == "up":
+                dy = amount
+            elif direction == "right":
+                dx = -amount
+            elif direction == "left":
+                dx = amount
+            scroll_event = CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitLine, 2, dy, dx)
+            CGEventPost(kCGHIDEventTap, scroll_event)
+        except ImportError:
+            # Fallback: AppleScript scroll
+            pass
+
+    def move_cursor(self, x: int, y: int) -> None:
+        try:
+            from Quartz import (
+                CGEventCreateMouseEvent,
+                CGEventPost,
+                CGPointMake,
+                kCGEventMouseMoved,
+                kCGHIDEventTap,
+                kCGMouseButtonLeft,
+            )
+
+            point = CGPointMake(x, y)
+            move = CGEventCreateMouseEvent(None, kCGEventMouseMoved, point, kCGMouseButtonLeft)
+            CGEventPost(kCGHIDEventTap, move)
+        except ImportError:
+            subprocess.run(
+                ["osascript", "-e", f'do shell script "cliclick m:{x},{y}"'],
+                capture_output=True,
+            )
+
+    def type_text(self, text: str) -> None:
+        """Type text into the focused element via clipboard paste.
+
+        Uses NSPasteboard + AppleScript Cmd+V.  AppleScript's keystroke route
+        reaches Chromium-based browsers (Teams, Edge, Chrome) where CGEvent
+        posts at kCGHIDEventTap are silently dropped.
+
+        Saves and restores the previous clipboard content so the user's
+        clipboard is not clobbered.
+        """
+        from AppKit import NSPasteboard, NSPasteboardTypeString
+
+        pb = NSPasteboard.generalPasteboard()
+
+        # Save current clipboard (all types).
+        old_items: list[tuple[str, bytes]] = []
+        old_types = pb.types()
+        if old_types:
+            for t in old_types:
+                d = pb.dataForType_(t)
+                if d:
+                    old_items.append((t, bytes(d)))
+
+        pb.clearContents()
+        pb.setString_forType_(text, NSPasteboardTypeString)
+
+        # Cmd+V via AppleScript — works in browsers where CGEvent is blocked.
+        subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to keystroke "v" using command down'],
+            timeout=5,
+        )
+
+        # Wait for the target app to read the clipboard, then restore.
+        time.sleep(0.15)
+        pb.clearContents()
+        if old_items:
+            from AppKit import NSData
+            for t, raw in old_items:
+                pb.setData_forType_(NSData.dataWithBytes_length_(raw, len(raw)), t)
+
+    def get_clipboard(self) -> ClipboardContent:
+        """Read structured clipboard content."""
+        try:
+            # Check available types via 'clipboard info'
+            info_result = subprocess.run(
+                ["osascript", "-e", "clipboard info"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            info = info_result.stdout if info_result.returncode == 0 else ""
+
+            # Files — check for file URL type
+            if "furl" in info or "public.file-url" in info:
+                file_result = subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        'set fileList to paragraphs of (do shell script '
+                        '"pbpaste -Prefer public.file-url 2>/dev/null || true")\n'
+                        "set output to {}\n"
+                        "repeat with f in fileList\n"
+                        '  if f as text is not "" then set end of output to f as text\n'
+                        "end repeat\n"
+                        'set AppleScript\'s text item delimiters to "\\n"\n'
+                        "return output as text",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                if file_result.returncode == 0 and file_result.stdout.strip():
+                    files = [
+                        f
+                        for f in file_result.stdout.strip().split("\n")
+                        if f.strip()
+                    ]
+                    if files:
+                        return ClipboardContent(kind="files", files=files)
+
+            # Image — check for image types
+            if "PNGf" in info or "TIFF" in info or "public.png" in info:
+                # Get image dimensions via sips on a temp file
+                try:
+                    import tempfile
+
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                        tmp_path = tmp.name
+                    subprocess.run(
+                        [
+                            "osascript",
+                            "-e",
+                            f'set imgData to the clipboard as «class PNGf»\n'
+                            f'set fp to open for access POSIX file'
+                            f' "{tmp_path}" with write permission\n'
+                            f"write imgData to fp\n"
+                            f"close access fp",
+                        ],
+                        capture_output=True,
+                        timeout=3,
+                    )
+                    sips = subprocess.run(
+                        ["sips", "-g", "pixelWidth", "-g", "pixelHeight", tmp_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=2,
+                    )
+                    import os
+
+                    os.unlink(tmp_path)
+                    w, h = 0, 0
+                    for line in sips.stdout.split("\n"):
+                        if "pixelWidth" in line:
+                            w = int(line.split(":")[-1].strip())
+                        elif "pixelHeight" in line:
+                            h = int(line.split(":")[-1].strip())
+                    if w and h:
+                        return ClipboardContent(
+                            kind="image", image_width=w, image_height=h
+                        )
+                except Exception:
+                    pass
+                return ClipboardContent(kind="image")
+
+            # Text fallback
+            text_result = subprocess.run(
+                ["pbpaste"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            text = text_result.stdout if text_result.returncode == 0 else ""
+            if text:
+                return ClipboardContent(kind="text", text=text)
+
+            return ClipboardContent()
+        except Exception:
+            return ClipboardContent()
+
+    def key_press(self, *keys: str) -> None:
+        """Press a keyboard shortcut.
+
+        Uses AppleScript when modifier keys are involved (Chromium browsers
+        silently drop CGEvent modifier combos posted at kCGHIDEventTap).
+        Falls back to CGEvent for plain keys without modifiers to avoid the
+        ~100ms AppleScript overhead.
+
+        Accepts modifier names (cmd, shift, ctrl, alt/option) and a trigger key.
+        Examples: key_press("cmd", "s"), key_press("cmd", "shift", "e"),
+                  key_press("return"), key_press("tab")
+        """
+        _MODIFIER_NAMES = {
+            "cmd", "command", "shift", "ctrl", "control", "alt", "option",
+        }
+
+        has_modifier = any(k.lower() in _MODIFIER_NAMES for k in keys)
+        if has_modifier:
+            self._key_press_applescript(*keys)
+        else:
+            self._key_press_cgevent(*keys)
+
+    def _key_press_cgevent(self, *keys: str) -> None:
+        """Press a key via CGEvent (no modifiers)."""
+        from Quartz import (
+            CGEventCreateKeyboardEvent,
+            CGEventKeyboardSetUnicodeString,
+            CGEventPost,
+            kCGHIDEventTap,
+        )
+
+        # macOS virtual keycodes (kVK_* from Events.h)
+        _KEYCODE_MAP = {
+            "return": 36, "enter": 36, "tab": 48, "escape": 53, "esc": 53,
+            "delete": 51, "backspace": 51, "forward_delete": 117,
+            "space": 49, "up": 126, "down": 125, "left": 123, "right": 124,
+            "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
+            "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96,
+            "f6": 97, "f7": 98, "f8": 100, "f9": 101, "f10": 109,
+            "f11": 103, "f12": 111,
+        }
+
+        # Printable ASCII → macOS keycode (US QWERTY layout)
+        _CHAR_KEYCODE = {
+            "a": 0, "b": 11, "c": 8, "d": 2, "e": 14, "f": 3, "g": 5,
+            "h": 4, "i": 34, "j": 38, "k": 40, "l": 37, "m": 46, "n": 45,
+            "o": 31, "p": 35, "q": 12, "r": 15, "s": 1, "t": 17, "u": 32,
+            "v": 9, "w": 13, "x": 7, "y": 16, "z": 6,
+            "0": 29, "1": 18, "2": 19, "3": 20, "4": 21,
+            "5": 23, "6": 22, "7": 26, "8": 28, "9": 25,
+            "-": 27, "=": 24, "[": 33, "]": 30, "\\": 42,
+            ";": 41, "'": 39, ",": 43, ".": 47, "/": 44, "`": 50,
+        }
+
+        for k in keys:
+            kl = k.lower()
+            trigger_char: str | None = None
+            if kl in _KEYCODE_MAP:
+                keycode = _KEYCODE_MAP[kl]
+            elif kl in _CHAR_KEYCODE:
+                keycode = _CHAR_KEYCODE[kl]
+                trigger_char = kl
+            elif len(kl) == 1:
+                self._key_press_applescript(k)
+                return
+            else:
+                log.warning("Unknown key: %s", kl)
+                return
+
+            key_down = CGEventCreateKeyboardEvent(None, keycode, True)
+            if trigger_char is not None:
+                CGEventKeyboardSetUnicodeString(key_down, len(trigger_char), trigger_char)
+            CGEventPost(kCGHIDEventTap, key_down)
+
+            key_up = CGEventCreateKeyboardEvent(None, keycode, False)
+            if trigger_char is not None:
+                CGEventKeyboardSetUnicodeString(key_up, len(trigger_char), trigger_char)
+            CGEventPost(kCGHIDEventTap, key_up)
+
+    def _key_press_applescript(self, *keys: str) -> None:
+        """Press a keyboard shortcut via AppleScript.
+
+        Uses ``keystroke`` for printable characters, ``key code`` for special
+        keys (Return, Tab, arrows, etc.).  Works in Chromium browsers where
+        CGEvent modifier combos are silently dropped.
+        """
+        _MODIFIER_MAP = {
+            "cmd": "command down", "command": "command down",
+            "shift": "shift down", "ctrl": "control down", "control": "control down",
+            "alt": "option down", "option": "option down",
+        }
+
+        # AppleScript key codes for non-printable keys
+        _SPECIAL_KEYCODE = {
+            "return": 36, "enter": 36, "tab": 48, "escape": 53, "esc": 53,
+            "delete": 51, "backspace": 51, "forward_delete": 117,
+            "space": 49, "up": 126, "down": 125, "left": 123, "right": 124,
+            "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
+            "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96,
+            "f6": 97, "f7": 98, "f8": 100, "f9": 101, "f10": 109,
+            "f11": 103, "f12": 111,
+        }
+
+        modifiers = []
+        trigger = None
+        for k in keys:
+            kl = k.lower()
+            if kl in _MODIFIER_MAP:
+                modifiers.append(_MODIFIER_MAP[kl])
+            else:
+                trigger = kl
+        if trigger is None:
+            return
+        using = f" using {{{', '.join(modifiers)}}}" if modifiers else ""
+        trigger_lower = trigger.lower()
+        if trigger_lower in _SPECIAL_KEYCODE:
+            code = _SPECIAL_KEYCODE[trigger_lower]
+            script = f'tell application "System Events" to key code {code}{using}'
+        else:
+            trigger_esc = _escape_applescript(trigger)
+            script = f'tell application "System Events" to keystroke "{trigger_esc}"{using}'
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+
+    # ── Accessibility (UI element discovery) ─────────────
+
+    def _find_ax_element(
+        self, app: str, label: str, *, role: str = "", timeout: float = 3.0
+    ) -> object | None:
+        """DFS search for an AXUIElement matching label.
+
+        Uses role-based pruning and a time budget to handle deep
+        web-rendered trees (e.g. WebKit inside Outlook).
+
+        Returns the AXUIElement reference, or None if not found.
+        """
+
+        try:
+            from ApplicationServices import (
+                AXUIElementCopyAttributeValue,
+                AXUIElementCreateApplication,
+            )
+        except ImportError:
+            return None
+
+        pid = self._find_app_pid(app)
+        if pid is None:
+            return None
+
+        app_ref = AXUIElementCreateApplication(pid)
+
+        # Force Chromium-based apps to fully expose web content AX tree
+        try:
+            from ApplicationServices import AXUIElementSetAttributeValue
+            AXUIElementSetAttributeValue(
+                app_ref, "AXEnhancedUserInterface", True,
+            )
+        except Exception:
+            pass
+
+        _ACTIONABLE_ROLES = {
+            "AXButton", "AXTextField", "AXTextArea", "AXCheckBox", "AXRadioButton",
+            "AXPopUpButton", "AXComboBox", "AXSlider", "AXMenuItem", "AXMenuBarItem",
+            "AXLink", "AXTab", "AXStaticText", "AXImage",
+        }
+        _SKIP_ROLES = {"AXMenuBar", "AXMenu"}
+
+        max_depth = 30
+        deadline = time.monotonic() + timeout
+
+        stack: list[tuple[object, int]] = [(app_ref, 0)]
+
+        while stack:
+            if time.monotonic() > deadline:
+                break
+            el, depth = stack.pop()
+            if depth > max_depth:
+                continue
+
+            err_r, el_role = AXUIElementCopyAttributeValue(el, "AXRole", None)
+            role_str = str(el_role) if el_role else ""
+
+            if role_str in _SKIP_ROLES:
+                continue
+
+            if role_str in _ACTIONABLE_ROLES:
+                for attr in ("AXTitle", "AXDescription", "AXValue", "AXPlaceholderValue"):
+                    try:
+                        err, val = AXUIElementCopyAttributeValue(el, attr, None)
+                    except Exception:
+                        continue
+                    if val and label.lower() in str(val).lower():
+                        if role and role_str != role:
+                            continue
+                        return el
+
+            try:
+                err_c, children = AXUIElementCopyAttributeValue(el, "AXChildren", None)
+            except Exception:
+                continue
+            if children:
+                for i in range(len(children) - 1, -1, -1):
+                    stack.append((children[i], depth + 1))
+
+        return None
+
+    def find_element(
+        self, app: str, label: str, *, role: str = "", timeout: float = 3.0
+    ) -> tuple[int, int] | None:
+        """Find a UI element by label and return its center (x, y)."""
+        try:
+            from ApplicationServices import AXUIElementCopyAttributeValue
+        except ImportError:
+            return None
+
+        el = self._find_ax_element(app, label, role=role, timeout=timeout)
+        if el is None:
+            return None
+
+        try:
+            err1, pos_val = AXUIElementCopyAttributeValue(el, "AXPosition", None)
+            err2, size_val = AXUIElementCopyAttributeValue(el, "AXSize", None)
+        except Exception:
+            return None
+        pos_x, pos_y = _extract_ax_point(pos_val)
+        w, h = _extract_ax_size(size_val)
+        if pos_x is not None and pos_y is not None and w is not None and h is not None:
+            return (int(pos_x + w / 2), int(pos_y + h / 2))
+        return None
+
+    def ax_press(self, app: str, label: str, *, role: str = "") -> bool:
+        """Find element and perform AXPress — reliable for web-rendered controls."""
+        try:
+            from ApplicationServices import AXUIElementPerformAction
+        except ImportError:
+            return False
+
+        el = self._find_ax_element(app, label, role=role)
+        if el is None:
+            return False
+
+        err = AXUIElementPerformAction(el, "AXPress")
+        return err == 0
+
+    def select_option(self, app: str, label: str, value: str) -> bool:
+        """Select an option from a dropdown/popup.
+
+        Strategies (tried in order):
+        1. AXPress: activate + click to open → find menuWindow → DFS for
+           matching text → AXPress deepest-first until popup closes
+        2. AXSelectedRows: find AXTable in menuWindow → set AXSelectedRows
+           on matching row → Enter to confirm (handles scrollable lists)
+        """
+
+        try:
+            from ApplicationServices import (
+                AXUIElementCopyAttributeValue,
+                AXUIElementCreateApplication,
+                AXUIElementPerformAction,
+                AXUIElementSetAttributeValue,
+            )
+        except ImportError:
+            return False
+
+        el = self._find_ax_element(app, label, role="AXPopUpButton")
+        if el is None:
+            el = self._find_ax_element(app, label)
+        if el is None:
+            return False
+
+        pid = self._find_app_pid(app)
+        if pid is None:
+            return False
+        app_ref = AXUIElementCreateApplication(pid)
+
+        _, pos_val = AXUIElementCopyAttributeValue(el, "AXPosition", None)
+        _, size_val = AXUIElementCopyAttributeValue(el, "AXSize", None)
+        px, py = _extract_ax_point(pos_val)
+        w, h = _extract_ax_size(size_val)
+        if px is None or py is None or w is None or h is None:
+            return False
+        cx, cy = int(px + w / 2), int(py + h / 2)
+
+        def _menu_window():
+            _, wins = AXUIElementCopyAttributeValue(app_ref, "AXWindows", None)
+            if wins:
+                for win in wins:
+                    _, t = AXUIElementCopyAttributeValue(win, "AXTitle", None)
+                    if str(t) == "menuWindow":
+                        return win
+            return None
+
+        def _popup_gone() -> bool:
+            time.sleep(0.3)
+            return _menu_window() is None
+
+        def _match_text(node) -> bool:
+            for attr in ("AXTitle", "AXValue", "AXDescription"):
+                try:
+                    _, v = AXUIElementCopyAttributeValue(node, attr, None)
+                except Exception:
+                    continue
+                if v and value.lower() in str(v).lower():
+                    return True
+            return False
+
+        def _try_press_deep(node) -> bool:
+            """AXPress from deepest child up; return True if popup closes."""
+            try:
+                _, nc = AXUIElementCopyAttributeValue(node, "AXChildren", None)
+            except Exception:
+                nc = None
+            if nc:
+                for child in nc:
+                    if _try_press_deep(child):
+                        return True
+            err = AXUIElementPerformAction(node, "AXPress")
+            if err == 0 and _popup_gone():
+                return True
+            return False
+
+        # Check if dropdown is already open (agent may have clicked it first)
+        mw = _menu_window()
+        if mw is None:
+            # Open the dropdown
+            self.activate_app(app)
+            time.sleep(0.3)
+            self.click(cx, cy)
+            time.sleep(0.5)
+            mw = _menu_window()
+        if mw is None:
+            return False
+
+        # --- Strategy 1: AXSelectedRows + Enter (preferred) ---
+        # Works for both scrollable and non-scrollable menuWindow popups.
+        # AXSelectedRows scrolls the target row into view and highlights it.
+        try:
+            from Foundation import NSArray
+        except ImportError:
+            NSArray = None
+
+        if NSArray is not None:
+            _, sa_list = AXUIElementCopyAttributeValue(mw, "AXChildren", None)
+            if sa_list:
+                for sa in sa_list:
+                    _, sr = AXUIElementCopyAttributeValue(sa, "AXRole", None)
+                    if str(sr) != "AXScrollArea":
+                        continue
+                    _, tl = AXUIElementCopyAttributeValue(sa, "AXChildren", None)
+                    if not tl:
+                        continue
+                    for tbl in tl:
+                        _, tr = AXUIElementCopyAttributeValue(tbl, "AXRole", None)
+                        if str(tr) != "AXTable":
+                            continue
+                        _, rows = AXUIElementCopyAttributeValue(tbl, "AXChildren", None)
+                        if not rows:
+                            continue
+                        for row in rows:
+                            _, rr = AXUIElementCopyAttributeValue(row, "AXRole", None)
+                            if str(rr) != "AXRow":
+                                continue
+                            rs = [row]
+                            found = False
+                            while rs:
+                                rn = rs.pop()
+                                if _match_text(rn):
+                                    found = True
+                                    break
+                                try:
+                                    _, rnc = AXUIElementCopyAttributeValue(
+                                        rn, "AXChildren", None
+                                    )
+                                except Exception:
+                                    continue
+                                if rnc:
+                                    rs.extend(rnc)
+                            if found:
+                                AXUIElementSetAttributeValue(
+                                    tbl, "AXSelectedRows",
+                                    NSArray.arrayWithObject_(row),
+                                )
+                                if _popup_gone():
+                                    return True
+                                self.key_press("return")
+                                if _popup_gone():
+                                    return True
+                                break
+
+        # --- Strategy 2: menuWindow DFS → AXPress (fallback) ---
+        mw = _menu_window()
+        if mw is None:
+            # Strategy 1 closed it but we missed the check — treat as success
+            return True
+
+        stack = [(mw, 0)]
+        visited = 0
+        while stack and visited < 500:
+            node, depth = stack.pop()
+            visited += 1
+            if _match_text(node):
+                if _try_press_deep(node):
+                    return True
+                break
+            try:
+                _, nc = AXUIElementCopyAttributeValue(node, "AXChildren", None)
+            except Exception:
+                continue
+            if nc:
+                for ci in range(len(nc) - 1, -1, -1):
+                    stack.append((nc[ci], depth + 1))
+
+        # All failed — dismiss
+        if _menu_window():
+            self.key_press("escape")
+        return False
+
+    def find_menu_item(self, app: str, menu_path: str) -> bool:
+        """Click a menu item via AppleScript.
+
+        Supports nested menus: "File > New > Meeting" (any depth).
+        Activates the app first, then navigates the menu bar.
+        """
+        parts = [p.strip() for p in menu_path.split(">")]
+        if len(parts) < 2:
+            return False
+
+        # Find the process name as seen by System Events
+        process_name = self._find_process_name(app)
+        if not process_name:
+            process_name = app
+
+        # Build nested AppleScript for arbitrary depth:
+        # click menu item "Meeting" of menu 1 of menu item "New"
+        # of menu 1 of menu bar item "File" of menu bar 1
+        # parts = ["File", "New", "Meeting"]
+        # → menu bar item "File" of menu bar 1
+        # → menu item "New" of menu 1 of (above)
+        # → menu item "Meeting" of menu 1 of (above)
+        chain = f'menu bar item "{_escape_applescript(parts[0])}" of menu bar 1'
+        for part in parts[1:-1]:
+            chain = f'menu item "{_escape_applescript(part)}" of menu 1 of {chain}'
+        menu_script = f'click menu item "{_escape_applescript(parts[-1])}" of menu 1 of {chain}'
+
+        script = (
+            f'tell application "{_escape_applescript(app)}" to activate\n'
+            f"delay 0.5\n"
+            f'tell application "System Events"\n'
+            f'  tell process "{_escape_applescript(process_name)}"\n'
+            f"    {menu_script}\n"
+            f"  end tell\n"
+            f"end tell"
+        )
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0 and result.stderr:
+            # Log for debugging — stderr has AppleScript error details
+            pass
+        return result.returncode == 0
+
+    def list_menu_items(self, app: str, menu_path: str = "") -> list[str]:
+        """List menu items at a given path via AppleScript."""
+        process_name = self._find_process_name(app) or app
+
+        if not menu_path:
+            script = (
+                f'tell application "System Events" to tell process '
+                f'"{_escape_applescript(process_name)}" to get '
+                f'name of every menu bar item of menu bar 1'
+            )
+        else:
+            parts = [pt.strip() for pt in menu_path.split(">")]
+            chain = f'menu bar item "{_escape_applescript(parts[0])}" of menu bar 1'
+            for part in parts[1:]:
+                chain = f'menu item "{_escape_applescript(part)}" of menu 1 of {chain}'
+            script = (
+                f'tell application "System Events" to tell process '
+                f'"{_escape_applescript(process_name)}" to get '
+                f'name of every menu item of menu 1 of {chain}'
+            )
+
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+        # AppleScript returns comma-separated list
+        raw = result.stdout.strip()
+        if not raw:
+            return []
+        return [item.strip() for item in raw.split(", ")]
+
+    def list_elements(self, app: str, max_depth: int = 8) -> list[str]:
+        """List visible UI elements in the frontmost window via AX API."""
+
+        try:
+            from ApplicationServices import (
+                AXUIElementCopyAttributeValue,
+                AXUIElementCreateApplication,
+            )
+        except ImportError:
+            return []
+
+        pid = self._find_app_pid(app)
+        if pid is None:
+            return []
+
+        app_ref = AXUIElementCreateApplication(pid)
+        max_depth = min(max_depth, 15)
+
+        # Force Chromium-based apps to fully expose web content AX tree
+        try:
+            from ApplicationServices import AXUIElementSetAttributeValue
+            AXUIElementSetAttributeValue(
+                app_ref, "AXEnhancedUserInterface", True,
+            )
+        except Exception:
+            pass
+
+        _ACTIONABLE_ROLES = {
+            "AXButton", "AXTextField", "AXTextArea", "AXCheckBox", "AXRadioButton",
+            "AXPopUpButton", "AXComboBox", "AXSlider", "AXMenuItem", "AXMenuBarItem",
+            "AXLink", "AXTab", "AXTabGroup", "AXToolbar", "AXStaticText",
+        }
+        _SKIP_ROLES = {"AXMenuBar", "AXMenu"}
+
+        results: list[str] = []
+        deadline = time.monotonic() + 3.0
+
+        # DFS with time budget and pruning
+        stack: list[tuple[object, int]] = [(app_ref, 0)]
+        while stack and len(results) < 80:
+            if time.monotonic() > deadline:
+                break
+            el, depth = stack.pop()
+            if depth > max_depth:
+                continue
+
+            err_r, role = AXUIElementCopyAttributeValue(el, "AXRole", None)
+            role_str = str(role) if err_r == 0 and role else ""
+
+            if role_str in _SKIP_ROLES:
+                continue
+
+            if role_str in _ACTIONABLE_ROLES:
+                err_t, title = AXUIElementCopyAttributeValue(el, "AXTitle", None)
+                err_d, desc = AXUIElementCopyAttributeValue(el, "AXDescription", None)
+                err_v, value = AXUIElementCopyAttributeValue(el, "AXValue", None)
+
+                label = str(title) if err_t == 0 and title else ""
+                desc_str = str(desc) if err_d == 0 and desc else ""
+                val_str = str(value)[:50] if err_v == 0 and value else ""
+
+                display = label or desc_str or val_str
+                if display:
+                    indent = "  " * depth
+                    results.append(f"{indent}{role_str}: {display!r}")
+
+            try:
+                err_c, children = AXUIElementCopyAttributeValue(el, "AXChildren", None)
+            except Exception:
+                continue
+            if children:
+                for i in range(len(children) - 1, -1, -1):
+                    stack.append((children[i], depth + 1))
+
+        return results
+
+    def get_element_role(self, app: str, label: str) -> str | None:
+        try:
+            from ApplicationServices import AXUIElementCopyAttributeValue
+        except ImportError:
+            return None
+        el = self._find_ax_element(app, label)
+        if el is None:
+            return None
+        _, role = AXUIElementCopyAttributeValue(el, "AXRole", None)
+        return str(role) if role else None
+
+    def element_at(self, x: int, y: int) -> ElementInfo | None:
+        """Get the accessibility element at global screen coordinates.
+
+        Walks up from the hit-test leaf to the nearest actionable ancestor
+        when the leaf itself has no useful label.
+        """
+        try:
+            from ApplicationServices import (
+                AXUIElementCopyAttributeValue,
+                AXUIElementCopyElementAtPosition,
+                AXUIElementCreateSystemWide,
+            )
+        except ImportError:
+            return None
+
+        _ACTIONABLE_ROLES = {
+            "AXButton", "AXTextField", "AXTextArea", "AXCheckBox",
+            "AXRadioButton", "AXPopUpButton", "AXComboBox", "AXSlider",
+            "AXMenuItem", "AXMenuBarItem", "AXLink", "AXTab",
+            "AXStaticText", "AXImage", "AXToolbar",
+        }
+        _STOP_ROLES = {"AXWindow", "AXApplication", "AXWebArea"}
+
+        system = AXUIElementCreateSystemWide()
+        err, el = AXUIElementCopyElementAtPosition(
+            system, float(x), float(y), None,
+        )
+        if err != 0 or el is None:
+            return None
+
+        def _get_label(node) -> str:
+            for attr in ("AXTitle", "AXDescription", "AXValue"):
+                _, val = AXUIElementCopyAttributeValue(node, attr, None)
+                if val and str(val).strip():
+                    return str(val)
+            return ""
+
+        def _get_role(node) -> str:
+            _, r = AXUIElementCopyAttributeValue(node, "AXRole", None)
+            return str(r) if r else ""
+
+        # Walk up to find the nearest meaningful element
+        current = el
+        for _ in range(15):
+            role_str = _get_role(current)
+            if role_str in _STOP_ROLES:
+                break
+            label = _get_label(current)
+            if role_str in _ACTIONABLE_ROLES and label:
+                el = current
+                break
+            if (
+                role_str in _ACTIONABLE_ROLES
+                and _get_role(el) not in _ACTIONABLE_ROLES
+            ):
+                el = current
+            try:
+                _, parent = AXUIElementCopyAttributeValue(
+                    current, "AXParent", None,
+                )
+            except Exception:
+                break
+            if parent is None:
+                break
+            current = parent
+
+        # Extract final element info
+        role_str = _get_role(el)
+        label = _get_label(el)
+
+        _, pos_val = AXUIElementCopyAttributeValue(el, "AXPosition", None)
+        _, size_val = AXUIElementCopyAttributeValue(el, "AXSize", None)
+        pos_x, pos_y = _extract_ax_point(pos_val)
+        w, h = _extract_ax_size(size_val)
+        if pos_x is None or pos_y is None or w is None or h is None:
+            return None
+
+        return ElementInfo(
+            role=role_str,
+            label=label,
+            center_x=int(pos_x + w / 2),
+            center_y=int(pos_y + h / 2),
+            width=int(w),
+            height=int(h),
+        )
+
+    def find_elements(self, app: str, query: str) -> list:
+        """Fuzzy-search UI elements by text — returns list of ElementInfo.
+
+        Matches query (case-insensitive substring) against all text attributes.
+        Dedupes by center position.
+        """
+
+        try:
+            from ApplicationServices import (
+                AXUIElementCopyAttributeValue,
+                AXUIElementCreateApplication,
+            )
+        except ImportError:
+            return []
+
+        pid = self._find_app_pid(app)
+        if pid is None:
+            return []
+
+        app_ref = AXUIElementCreateApplication(pid)
+
+        # Force Chromium-based apps (Teams, Edge) to fully expose web content
+        # AX tree. Without this, AXChildren on native View wrappers returns
+        # empty, cutting off the entire web content subtree.
+        try:
+            from ApplicationServices import AXUIElementSetAttributeValue
+            AXUIElementSetAttributeValue(
+                app_ref, "AXEnhancedUserInterface", True,
+            )
+        except Exception:
+            pass
+
+        _SKIP_ROLES = {
+            "AXMenuBar", "AXMenu",
+        }
+        _LABEL_ATTRS = (
+            "AXTitle", "AXDescription", "AXValue", "AXPlaceholderValue",
+        )
+
+        query_lower = query.lower()
+        results: list[ElementInfo] = []
+        seen_positions: set[tuple[int, int]] = set()
+        deadline = time.monotonic() + 3.0
+        max_depth = 25
+
+        stack: list[tuple[object, int]] = [(app_ref, 0)]
+        while stack and len(results) < 50:
+            if time.monotonic() > deadline:
+                break
+            el, depth = stack.pop()
+            if depth > max_depth:
+                continue
+
+            err_r, role = AXUIElementCopyAttributeValue(el, "AXRole", None)
+            role_str = str(role) if err_r == 0 and role else ""
+
+            if role_str in _SKIP_ROLES:
+                continue
+
+            matched_label = ""
+            for attr in _LABEL_ATTRS:
+                try:
+                    _, val = AXUIElementCopyAttributeValue(el, attr, None)
+                except Exception:
+                    continue
+                if val and query_lower in str(val).lower():
+                    matched_label = str(val)
+                    break
+
+            if matched_label:
+                _, pos_val = AXUIElementCopyAttributeValue(
+                    el, "AXPosition", None,
+                )
+                _, size_val = AXUIElementCopyAttributeValue(
+                    el, "AXSize", None,
+                )
+                px, py = _extract_ax_point(pos_val)
+                w, h = _extract_ax_size(size_val)
+                if (
+                    px is not None
+                    and py is not None
+                    and w is not None
+                    and h is not None
+                    and int(w) >= 5
+                    and int(h) >= 5
+                ):
+                    cx, cy = int(px + w / 2), int(py + h / 2)
+                    if (cx, cy) not in seen_positions:
+                        seen_positions.add((cx, cy))
+                        results.append(ElementInfo(
+                            role=role_str,
+                            label=matched_label,
+                            center_x=cx,
+                            center_y=cy,
+                            width=int(w),
+                            height=int(h),
+                        ))
+
+            try:
+                err_c, children = AXUIElementCopyAttributeValue(
+                    el, "AXChildren", None,
+                )
+            except Exception:
+                continue
+            if children:
+                for i in range(len(children) - 1, -1, -1):
+                    stack.append((children[i], depth + 1))
+
+        if not results:
+            log.warning("find_elements(%r, %r): 0 results (pid=%s)", app, query, pid)
+
+        return results
+
+    def activate_app(self, app: str) -> None:
+        """Bring an application to the foreground via AppleScript."""
+        subprocess.run(
+            ["osascript", "-e", f'tell application "{_escape_applescript(app)}" to activate'],
+            capture_output=True, timeout=5,
+        )
+
+    def _find_process_name(self, app_name: str) -> str | None:
+        """Find the System Events process name for an app."""
+        try:
+            from AppKit import NSWorkspace
+
+            for app_info in NSWorkspace.sharedWorkspace().runningApplications():
+                localized = app_info.localizedName() or ""
+                if app_name.lower() in localized.lower():
+                    # System Events uses the bundle's executable name,
+                    # which is usually the localized name
+                    return localized
+        except Exception:
+            pass
+        return None
+
+    def _find_app_pid(self, app_name: str) -> int | None:
+        """Find PID of an app by name."""
+        try:
+            from AppKit import NSWorkspace
+
+            for app_info in NSWorkspace.sharedWorkspace().runningApplications():
+                name = app_info.localizedName() or ""
+                if name.lower() == app_name.lower() or app_name.lower() in name.lower():
+                    return app_info.processIdentifier()
+        except Exception:
+            pass
+        return None
+
+    # ── Notifications ────────────────────────────────────
+
+    def notify(self, title: str, message: str, *, sound: bool = True) -> None:
+        script = (
+            f'display notification "{_escape_applescript(message)}" '
+            f'with title "{_escape_applescript(title)}"'
+        )
+        if sound:
+            script += ' sound name "Glass"'
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+
+    # ── Text prompt (Spotlight-style floating input) ────
+
+    def prompt_text(
+        self, title: str, placeholder: str = "", message: str = "",
+    ) -> str | None:
+        """Show a Spotlight-style floating NSPanel and wait for user input."""
+        # Use a subprocess to avoid AppKit / pynput main-thread conflicts.
+        # The subprocess creates an NSPanel, waits for Enter, prints JSON result.
+        script = (
+            _PROMPT_PANEL_SCRIPT
+            .replace("__TITLE__", _escape_applescript(title))
+            .replace("__PLACEHOLDER__", _escape_applescript(placeholder))
+            .replace("__MESSAGE__", _escape_applescript(message))
+        )
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                return None
+            data = json.loads(result.stdout.strip())
+            return data.get("text")
+        except Exception:
+            return None
+
+    # ── Global hotkey ────────────────────────────────────
+
+    def register_hotkey(self, keys: list[str], callback: Callable[[], None]) -> Callable[[], None]:
+        # Check accessibility permission — prompt the user if not granted
+        self._ensure_accessibility()
+
+        import threading
+
+        from Quartz import (
+            CFMachPortCreateRunLoopSource,
+            CFRunLoopAddSource,
+            CFRunLoopGetCurrent,
+            CFRunLoopRun,
+            CFRunLoopStop,
+            CGEventGetFlags,
+            CGEventGetIntegerValueField,
+            CGEventMaskBit,
+            CGEventTapCreate,
+            kCFRunLoopCommonModes,
+            kCGEventFlagMaskAlternate,
+            kCGEventFlagMaskCommand,
+            kCGEventFlagMaskControl,
+            kCGEventFlagMaskShift,
+            kCGEventKeyDown,
+            kCGHeadInsertEventTap,
+            kCGKeyboardEventKeycode,
+            kCGSessionEventTap,
+        )
+
+        # Map key names to modifier flags and keycodes
+        modifier_flags = 0
+        trigger_vk: int | None = None
+
+        flag_map = {
+            "alt": kCGEventFlagMaskAlternate,
+            "option": kCGEventFlagMaskAlternate,
+            "shift": kCGEventFlagMaskShift,
+            "cmd": kCGEventFlagMaskCommand,
+            "ctrl": kCGEventFlagMaskControl,
+        }
+        vk_map = {
+            "a": 0,
+            "s": 1,
+            "d": 2,
+            "f": 3,
+            "h": 4,
+            "g": 5,
+            "z": 6,
+            "x": 7,
+            "c": 8,
+            "v": 9,
+            "b": 11,
+            "q": 12,
+            "w": 13,
+            "e": 14,
+            "r": 15,
+            "y": 16,
+            "t": 17,
+        }
+
+        for k in keys:
+            k_lower = k.lower()
+            if k_lower in flag_map:
+                modifier_flags |= flag_map[k_lower]
+            elif k_lower in vk_map:
+                trigger_vk = vk_map[k_lower]
+            else:
+                raise ValueError(f"Unknown key: {k}")
+
+        if trigger_vk is None:
+            raise ValueError(f"Hotkey must include a non-modifier key, got: {keys}")
+
+        run_loop_ref = [None]
+
+        def _tap_callback(_proxy, _type, event, _refcon):
+            keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
+            flags = CGEventGetFlags(event)
+            if keycode == trigger_vk and (flags & modifier_flags) == modifier_flags:
+                callback()
+            return event
+
+        def _run_tap():
+            tap = CGEventTapCreate(
+                kCGSessionEventTap,
+                kCGHeadInsertEventTap,
+                0,  # listenOnly = 0 means we can observe
+                CGEventMaskBit(kCGEventKeyDown),
+                _tap_callback,
+                None,
+            )
+            if tap is None:
+                raise RuntimeError("Failed to create event tap. Check Accessibility permission.")
+
+            source = CFMachPortCreateRunLoopSource(None, tap, 0)
+            run_loop_ref[0] = CFRunLoopGetCurrent()
+            CFRunLoopAddSource(run_loop_ref[0], source, kCFRunLoopCommonModes)
+            CFRunLoopRun()
+
+        thread = threading.Thread(target=_run_tap, daemon=True)
+        thread.start()
+
+        def unregister() -> None:
+            if run_loop_ref[0]:
+                CFRunLoopStop(run_loop_ref[0])
+
+        return unregister
+
+    def _ensure_accessibility(self) -> None:
+        """Check Accessibility permission. If not granted, open the system prompt."""
+        from ApplicationServices import AXIsProcessTrustedWithOptions
+        from CoreFoundation import kCFBooleanTrue
+
+        options = {
+            "AXTrustedCheckOptionPrompt": kCFBooleanTrue,
+        }
+        trusted = AXIsProcessTrustedWithOptions(options)
+        if not trusted:
+            raise RuntimeError(
+                "Accessibility permission required. "
+                "Grant access in the dialog that just opened, then re-run."
+            )
+
+
+def configure_capture_proof_window(ns_window: object) -> None:
+    """Make an NSWindow invisible to screen capture on macOS.
+
+    Sets NSWindowSharingNone, ignoresMouseEvents, and canJoinAllSpaces.
+    Caller is responsible for app-level settings (e.g. activation policy).
+    """
+    import AppKit
+
+    # Invisible to screencapture / CGWindowListCreateImage / mss
+    ns_window.setSharingType_(AppKit.NSWindowSharingNone)  # type: ignore[union-attr]
+
+    # Visible on all Spaces
+    ns_window.setCollectionBehavior_(  # type: ignore[union-attr]
+        ns_window.collectionBehavior()  # type: ignore[union-attr]
+        | AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+    )
+
+
+def _escape_applescript(text: str) -> str:
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+
+
+# Python script run in a subprocess to show a Spotlight-style NSPanel.
+# Avoids AppKit / pynput main-thread conflicts in the daemon process.
+_PROMPT_PANEL_SCRIPT = '''
+import json, sys
+from AppKit import (
+    NSApplication, NSApp, NSPanel, NSTextField, NSFont, NSScreen,
+    NSBackingStoreBuffered, NSFloatingWindowLevel,
+    NSObject, NSColor,
+)
+from Foundation import NSMakeRect, NSPoint
+
+MESSAGE = "__MESSAGE__"
+
+class Delegate(NSObject):
+    result = None
+    field = None
+
+    def controlTextDidEndEditing_(self, notification):
+        text = self.field.stringValue().strip()
+        if text:
+            self.result = text
+            NSApp.stop_(None)
+
+    def windowWillClose_(self, notification):
+        NSApp.stop_(None)
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(1)  # NSApplicationActivationPolicyAccessory
+
+delegate = Delegate.alloc().init()
+
+# Calculate panel height based on message presence
+msg_height = 0
+if MESSAGE:
+    # Estimate lines: ~60 chars per line at font size 13 in 488px width
+    line_count = max(1, len(MESSAGE) // 60 + MESSAGE.count("\\n") + 1)
+    msg_height = min(line_count * 18 + 12, 200)  # cap at 200px
+
+panel_height = 52 + msg_height
+
+# Style mask: titled(1) | closable(2) | nonactivating(128) | HUD(8192)
+panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+    NSMakeRect(0, 0, 520, panel_height),
+    1 | 2 | 128 | 8192,
+    NSBackingStoreBuffered,
+    False,
+)
+panel.setLevel_(NSFloatingWindowLevel)
+panel.setMovableByWindowBackground_(True)
+panel.setHidesOnDeactivate_(False)
+panel.setDelegate_(delegate)
+panel.setTitle_("__TITLE__")
+
+# Message label (read-only, above the input field)
+if MESSAGE:
+    label = NSTextField.alloc().initWithFrame_(
+        NSMakeRect(16, 48, 488, msg_height)
+    )
+    label.setStringValue_(MESSAGE)
+    label.setFont_(NSFont.systemFontOfSize_(13))
+    label.setTextColor_(NSColor.secondaryLabelColor())
+    label.setEditable_(False)
+    label.setBordered_(False)
+    label.setDrawsBackground_(False)
+    label.setSelectable_(False)
+    panel.contentView().addSubview_(label)
+
+field = NSTextField.alloc().initWithFrame_(NSMakeRect(16, 10, 488, 32))
+field.setPlaceholderString_("__PLACEHOLDER__")
+field.setFont_(NSFont.systemFontOfSize_(16))
+field.setDelegate_(delegate)
+panel.contentView().addSubview_(field)
+delegate.field = field
+
+screen = NSScreen.mainScreen()
+if screen:
+    f = screen.visibleFrame()
+    x = f.origin.x + f.size.width / 2 - 260
+    y = f.origin.y + f.size.height / 2 + 100
+    panel.setFrameOrigin_(NSPoint(x, y))
+
+panel.makeKeyAndOrderFront_(None)
+app.activateIgnoringOtherApps_(True)
+field.becomeFirstResponder()
+
+app.run()
+
+if delegate.result:
+    print(json.dumps({"text": delegate.result}))
+else:
+    print(json.dumps({"text": None}))
+'''

@@ -1,0 +1,20 @@
+{
+  "v": 1,
+  "type": "room_state",
+  "id": "msg_0015",
+  "ts": 0,
+  "payload": {
+    "state": "ringing",
+    "call_id": "trtc-room-2026-05-09-001",
+    "remote_users": [
+      {
+        "user_id": "alice",
+        "has_audio": true,
+        "has_video": false,
+        "has_screen": false
+      }
+    ],
+    "network_quality": 4,
+    "detail": "presence:remote_user_joined"
+  }
+}

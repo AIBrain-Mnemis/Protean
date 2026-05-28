@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "type": "pong",
+  "id": "msg_0019",
+  "ts": 30.004,
+  "payload": {
+    "in_reply_to": "msg_0018"
+  }
+}

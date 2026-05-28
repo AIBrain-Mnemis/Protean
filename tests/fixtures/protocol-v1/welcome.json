@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "type": "welcome",
+  "id": "msg_0002",
+  "ts": 0,
+  "payload": {
+    "bridge_version": "0.1.0",
+    "capabilities": [
+      "realtime.gemini",
+      "transport.trtc",
+      "transport.local_mock",
+      "tools.local:start_screen,stop_screen,request_screenshot"
+    ]
+  }
+}

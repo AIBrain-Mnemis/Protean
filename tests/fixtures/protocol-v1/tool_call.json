@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "type": "tool_call",
+  "id": "msg_0010",
+  "ts": 23.701,
+  "payload": {
+    "call_id": "g-9f3",
+    "name": "execute_step",
+    "arguments": {
+      "intent": "Send the email",
+      "action": "Click the Send button in the Outlook compose window"
+    }
+  }
+}

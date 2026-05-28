@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "type": "notify",
+  "id": "msg_0012",
+  "ts": 41.205,
+  "payload": {
+    "text": "Done. The email was sent."
+  }
+}

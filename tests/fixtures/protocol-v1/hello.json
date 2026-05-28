@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "type": "hello",
+  "id": "msg_0001",
+  "ts": 0,
+  "payload": {
+    "protocol_version": 1,
+    "daemon_version": "0.1.0",
+    "daemon_pid": 4521
+  }
+}

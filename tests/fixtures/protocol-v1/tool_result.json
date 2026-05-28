@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "type": "tool_result",
+  "id": "msg_0011",
+  "ts": 23.748,
+  "payload": {
+    "in_reply_to": "msg_0010",
+    "call_id": "g-9f3",
+    "name": "execute_step",
+    "message": "Executing... I'll report when done.",
+    "is_async": true
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "type": "realtime_error",
+  "id": "msg_0009",
+  "ts": 42.117,
+  "payload": {
+    "code": "rate_limited",
+    "message": "Realtime provider is throttling requests; backing off.",
+    "recoverable": true
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "type": "session_started",
+  "id": "msg_0004",
+  "ts": 0.012,
+  "payload": {
+    "session_id": "sess_2026-05-09-001-7f3c"
+  }
+}

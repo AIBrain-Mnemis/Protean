@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "type": "session_ended",
+  "id": "msg_0006",
+  "ts": 187.430,
+  "payload": {
+    "reason": "call-ended",
+    "transcript_summary": {
+      "duration": 187.42,
+      "user_words": 312,
+      "assistant_words": 178
+    }
+  }
+}

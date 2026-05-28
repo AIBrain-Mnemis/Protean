@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "type": "user_speech",
+  "id": "msg_0008",
+  "ts": 11.901,
+  "payload": {
+    "text": "I want to create a meeting for next Tuesday at three.",
+    "audio_duration": 3.1,
+    "final": true
+  }
+}

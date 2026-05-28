@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "type": "send_text",
+  "id": "msg_0013",
+  "ts": 55.001,
+  "payload": {
+    "text": "Please confirm: did the meeting reminder show up correctly?"
+  }
+}

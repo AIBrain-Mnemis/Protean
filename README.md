@@ -4,7 +4,7 @@
 
 # Protean: Show the work. Build the worker. 
 
-> Learn from everyday demonstrations, turn workflows into reusable multimodal skills, and help agents evolve into autonomous digital workers.
+> Protean extends agents beyond their native capabilities, turning everyday demonstrations into multimodal skills they can use across real work environments to automate, adapt, and evolve into autonomous digital workers.
 
 Protean is a skill infrastructure for agents like **Codex, Claude Code, OpenClaw**, and other agents.
 

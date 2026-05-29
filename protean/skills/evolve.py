@@ -5,7 +5,7 @@ Entry point for the SkillFlow integration. After each task trial, call
 (create / refine / delete) and update the skill directory accordingly.
 
 Architecture:
-  - TrajectoryAdapter: ATIF trajectory (SkillFlow) → RunTrajectory (Protean)
+  - TrajectoryAdapter: external trajectory formats → RunTrajectory (Protean)
   - SkillEvolver: orchestrates the evolution loop
     - _route(): LLM decides what actions to take
     - dispatches to SkillBuilder.from_trajectory / refine / registry.delete
@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel, Field
 
 from protean.skills.builder import SkillBuilder, render_action_transcript
+from protean.skills.prompts.evolve_router import EVOLVE_ROUTER_PROMPT
 from protean.skills.registry import SkillRegistry
 from protean.skills.renderer import render_skill
 from protean.skills.runner import ExecutorAction, RunTrajectory, StepTrajectory
@@ -91,7 +92,57 @@ def _compute_skill_diff(
 
 
 class TrajectoryAdapter:
-    """Convert ATIF trajectory (SkillFlow format) to Protean RunTrajectory."""
+    """Convert external trajectory formats to Protean RunTrajectory."""
+
+    @staticmethod
+    def from_react(
+        events: list[dict[str, Any]],
+    ) -> tuple[list[ExecutorAction], str, str]:
+        """Extract actions from a normalized ReAct-style event list.
+
+        Expected event shape:
+          - {"type": "message", "role": "user"|"assistant", "message": str}
+          - {"type": "tool_call", "tool_name": str, "tool_args": dict}
+          - {"type": "tool_result", "tool_name": str, "result": str}
+        """
+        actions: list[ExecutorAction] = []
+        instruction = ""
+        final_response = ""
+
+        for event in events:
+            etype = event.get("type", "")
+            if etype == "message":
+                role = str(event.get("role") or "agent")
+                msg = str(event.get("message") or "")
+                if role == "user" and not instruction:
+                    instruction = msg
+                    continue
+                if msg:
+                    actions.append(ExecutorAction(
+                        result=f"[{role}] {msg}",
+                        event_type="message",
+                    ))
+                    if role == "assistant":
+                        final_response = msg
+                continue
+
+            if etype == "tool_call":
+                args = event.get("tool_args") or {}
+                actions.append(ExecutorAction(
+                    tool_name=str(event.get("tool_name") or ""),
+                    tool_args=args if isinstance(args, dict) else {},
+                    event_type="tool_call",
+                ))
+                continue
+
+            if etype == "tool_result":
+                actions.append(ExecutorAction(
+                    tool_name=str(event.get("tool_name") or ""),
+                    result=str(event.get("result") or ""),
+                    event_type="tool_result",
+                ))
+
+        return actions, instruction, final_response
 
     @staticmethod
     def from_atif(
@@ -230,6 +281,31 @@ class EvolveAction(BaseModel):
     reason: str = Field(
         description="Why this action is needed, based on the trajectory.",
     )
+    intent: str = Field(
+        default="",
+        description=(
+            "The focused library change this action should make. For create, "
+            "state the target reusable capability to author. For refine, state "
+            "the intended update to the existing skill. For delete, state what "
+            "should be removed or deprecated."
+        ),
+    )
+    observed_gap: str = Field(
+        default="",
+        description=(
+            "What the current skill library lacks, or what the existing target "
+            "skill got wrong or left underspecified."
+        ),
+    )
+    evidence: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Compact factual anchors from the trajectory supporting this action. "
+            "Use concrete observations about user requests, tool calls, tool "
+            "results, errors, corrections, successful recovery steps, or "
+            "verification outcomes."
+        ),
+    )
 
 
 class EvolveDecision(BaseModel):
@@ -242,83 +318,6 @@ class EvolveDecision(BaseModel):
         default="",
         description="Brief explanation of the overall evolution strategy.",
     )
-
-
-_ROUTER_PROMPT = """\
-You are a skill evolution router.
-
-Given an execution trajectory and the current skill library, decide how the skill library should change. A skill should represent a reusable capability, strategy, workflow, debugging heuristic, or validation pattern that transfers across many tasks. Prefer general techniques over task-specific procedures.
-
-## Execution trajectory
-{trajectory_summary}
-
-## Skills used in this exexecution
-{used_skills}
-
-## Task result
-- Task: {task_name}
-- Reward: {reward}
-- Failed tests: {failed_tests}
-
-## Decision rules
-
-Trajectories may contain reusable knowledge even when the task failed.
-
-Failures can reveal:
-- useful partial workflows,
-- debugging strategies,
-- common pitfalls,
-- verification techniques,
-- or corrective patterns.
-
-For each action, decide exactly one of:
-
-### refine
-
-Use when an existing skill already overlaps with the capability revealed by the trajectory, even if the overlap is partial.
-
-Refine when:
-- an existing skill missed an edge case,
-- the strategy was incomplete,
-- the validation logic was insufficient,
-- or the trajectory reveals a better generalized version of the skill.
-
-Prefer refining broader skills instead of creating narrowly specialized ones.
-
-### create
-
-Use only when the trajectory reveals a reusable capability that is not already covered by an existing skill.
-
-A new skill should capture:
-- a transferable strategy,
-- workflow,
-- debugging heuristic,
-- validation pattern,
-- or transformation technique
-
-that can help solve multiple unrelated tasks.
-
-Do not create skills tied to:
-- specific organizations,
-- datasets,
-- entities,
-- file names,
-- or one-off procedures.
-
-The skill name should describe the underlying capability rather than the surface task.
-
-### delete
-
-Use only when a skill is:
-- incorrect,
-- harmful,
-- redundant,
-- or fully superseded by another skill.
-
-Delete conservatively.
-
-Output structured decisions only.
-""" # noqa: E501
 
 
 # ── Evolver ──────────────────────────────────────────────
@@ -359,6 +358,24 @@ class SkillEvolver:
         self._temperature = temperature
         self._registry = SkillRegistry(skills_dir)
         self._builder = SkillBuilder()
+
+    @staticmethod
+    def _format_action_guidance(action: EvolveAction) -> str:
+        """Render a router action as focused guidance for the skill builder."""
+        lines = [
+            f"Action: {action.action}",
+            f"Target skill name: {action.skill_name}",
+        ]
+        if action.intent:
+            lines.append(f"Intent: {action.intent}")
+        if action.observed_gap:
+            lines.append(f"Observed gap: {action.observed_gap}")
+        if action.reason:
+            lines.append(f"Reason: {action.reason}")
+        if action.evidence:
+            lines.append("Evidence:")
+            lines.extend(f"- {item}" for item in action.evidence)
+        return "\n".join(lines)
 
     async def evolve(
         self,
@@ -461,7 +478,7 @@ class SkillEvolver:
             if step.verify_reason:
                 traj_lines.append(f"### Verification\n{step.verify_reason}")
 
-        prompt = _ROUTER_PROMPT.format(
+        prompt = EVOLVE_ROUTER_PROMPT.format(
             used_skills=", ".join(used_skills) if used_skills else "(none)",
             task_name=task_name,
             reward=reward if reward is not None else "N/A",
@@ -495,15 +512,11 @@ class SkillEvolver:
             trajectory,
             self._llm,
             task_context=task_context,
+            target_name=action.skill_name,
             model=self._model,
             temperature=self._temperature,
-            router_analysis=action.reason or "",
+            evolution_guidance=self._format_action_guidance(action),
         )
-
-        # Use router-suggested name if the LLM generated something generic
-        if action.skill_name and action.skill_name != skill.name:
-            skill.name = action.skill_name
-            skill.normalize_name()
 
         skill_dir = self._skills_dir / skill.name
         before = _snapshot_skill_dir(skill_dir)
@@ -518,6 +531,9 @@ class SkillEvolver:
             "skill": skill.name,
             "status": "ok",
             "reason": action.reason,
+            "intent": action.intent,
+            "observed_gap": action.observed_gap,
+            "evidence": action.evidence,
             "diff": diff,
         })
 
@@ -548,7 +564,7 @@ class SkillEvolver:
             self._llm,
             model=self._model,
             temperature=self._temperature,
-            router_analysis=action.reason or "",
+            evolution_guidance=self._format_action_guidance(action),
         )
 
         skill_dir = self._skills_dir / refined.name
@@ -564,6 +580,9 @@ class SkillEvolver:
             "skill": refined.name,
             "status": "ok",
             "reason": action.reason,
+            "intent": action.intent,
+            "observed_gap": action.observed_gap,
+            "evidence": action.evidence,
             "diff": diff,
         })
 
@@ -582,6 +601,9 @@ class SkillEvolver:
             "skill": action.skill_name,
             "status": status,
             "reason": action.reason,
+            "intent": action.intent,
+            "observed_gap": action.observed_gap,
+            "evidence": action.evidence,
         }
         if deleted:
             result.skills_deleted.append(action.skill_name)

@@ -5,6 +5,7 @@ without touching builder logic.
 """
 
 from protean.skills.prompts.create_from_trajectory import CREATE_FROM_TRAJECTORY_PROMPT
+from protean.skills.prompts.evolve_router import EVOLVE_ROUTER_PROMPT
 from protean.skills.prompts.finalize import FINALIZE_PROMPT
 from protean.skills.prompts.output_hotspot_hint import OUTPUT_HOTSPOT_HINT_PROMPT
 from protean.skills.prompts.recording import RECORDING_SYSTEM_PROMPT
@@ -13,6 +14,7 @@ from protean.skills.prompts.step_field_rules import STEP_FIELD_RULES
 
 __all__ = [
     "CREATE_FROM_TRAJECTORY_PROMPT",
+    "EVOLVE_ROUTER_PROMPT",
     "FINALIZE_PROMPT",
     "OUTPUT_HOTSPOT_HINT_PROMPT",
     "RECORDING_SYSTEM_PROMPT",

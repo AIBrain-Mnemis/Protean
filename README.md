@@ -89,6 +89,12 @@ All human-editable, version-controllable, and shareable.
 - **Python 3.12 – 3.13** managed via [`uv`](https://docs.astral.sh/uv/).
 - **An LLM provider key** in `.env` (at least one of OpenAI / Anthropic /
   Gemini / Doubao).
+- **`ffmpeg` + `ffprobe` on PATH** — required by `generate` (frame
+  extraction, scene detection, audio mux) and by the recorder backends
+  (Windows screen capture, macOS audio capture).
+  - macOS: `brew install ffmpeg`
+  - Windows: `winget install Gyan.FFmpeg` (or `choco install ffmpeg`)
+  - Linux: `apt install ffmpeg` (or distro equivalent)
 - **macOS**: grant Accessibility + Screen Recording permissions to your
   terminal.
 - **Windows**: native input + UIA backend; no extra permissions, but run from
@@ -98,6 +104,7 @@ All human-editable, version-controllable, and shareable.
   - Node ≥ 18 is enough if you only use the Computer-Use Agent terminal tool
     (via DesktopCommanderMCP); opt out entirely with
     `PROTEAN_CUA_TERMINAL=false`.
+- **Claude Code CLI** on PATH (only if you use `-E claude_code`).
 
 ## Install
 

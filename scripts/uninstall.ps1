@@ -25,14 +25,24 @@ Write-Host "Protean uninstall (root: $RepoRoot)" -ForegroundColor White
 
 # ---------- 1. unwire external agents -----------------------------------
 Write-Step "Unwire external agent runtimes (Codex / Claude Code)"
-if (-not (Test-Cmd 'uv')) {
-    Write-Skip "uv missing — cannot run 'protean agents uninstall'"
+if (-not (Test-Path '.venv\Scripts\protean.exe')) {
+    Write-Skip ".venv\Scripts\protean.exe missing — nothing to unwire"
 } else {
-    & uv run protean agents uninstall all
+    & .venv\Scripts\protean.exe agents uninstall all
     if ($LASTEXITCODE -eq 0) { Write-Pass "agents uninstall all" } else { Write-Fail "agents uninstall all failed" }
 }
 
-# ---------- 2. electron-bridge build artifacts --------------------------
+# ---------- 2. protean command shim --------------------------------------
+Write-Step "Remove 'protean' command shim"
+$ShimPath = Join-Path $env:USERPROFILE '.local\bin\protean.cmd'
+if (Test-Path $ShimPath) {
+    Remove-Item -Force $ShimPath
+    Write-Pass "removed $ShimPath"
+} else {
+    Write-Skip "$ShimPath not present"
+}
+
+# ---------- 3. electron-bridge build artifacts --------------------------
 Write-Step "Remove electron-bridge build artifacts"
 if (-not (Test-Path electron-bridge)) {
     Write-Skip "electron-bridge/ not present"

@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="Protean logo" width="160">
 </p>
 
-# Protean: Show the work. Build the worker. 
+# Protean: Show the work. Build the worker.
 
 > Protean extends agents beyond their native capabilities, turning everyday demonstrations into multimodal skills they can use across real work environments to automate, adapt, and evolve into autonomous digital workers.
 
@@ -160,7 +160,10 @@ See [`.env.example`](.env.example) for every supported variable and
 
 ## Usage
 
-All commands run via `uv run protean ...` — never bare `python`.
+After `setup.sh`, the `protean` command is on your PATH (via a shim at
+`~/.local/bin/protean` that delegates to the cloned repo's venv). All
+commands below use it directly.
+
 This section is organized by **entry channel** — pick the one that
 matches how you want capability to enter Protean.
 
@@ -170,8 +173,8 @@ Capture a session of you doing the task; an LLM turns the recording
 into a `Skill` afterwards.
 
 ```bash
-uv run protean record -o ./recordings/my-task   # Ctrl-C to stop
-uv run protean generate ./recordings/my-task -d "Create a calendar event"
+protean record -o ./recordings/my-task   # Ctrl-C to stop
+protean generate ./recordings/my-task -d "Create a calendar event"
 ```
 
 **Pass `-d "..."` on `generate`.** The task description grounds the LLM
@@ -184,8 +187,8 @@ itself doesn't take it.
 Other useful flags:
 
 ```bash
-uv run protean record -d 1                              # display 1
-uv run protean generate ./rec -d "..." -p anthropic -m claude-opus-4-6
+protean record -d 1                              # display 1
+protean generate ./rec -d "..." -p anthropic -m claude-opus-4-6
 ```
 
 **Tip:** for repeated recording, run the daemon (channel 2) and use the
@@ -202,9 +205,9 @@ watch it work (`start_screen(mode="share")`). Build the bridge once with
 `setup.sh` (it prompts), then start the daemon:
 
 ```bash
-uv run protean daemon
-uv run protean daemon --overlay         # add the capture-proof overlay
-uv run protean daemon -p anthropic -m claude-opus-4-6   # generation provider
+protean daemon
+protean daemon --overlay         # add the capture-proof overlay
+protean daemon -p anthropic -m claude-opus-4-6   # generation provider
 ```
 
 The daemon supervises the bridge subprocess and combines two flows:
@@ -223,8 +226,8 @@ Skip the skill creation step entirely. Hand the agent a natural-language
 task and let it figure out execution from scratch.
 
 ```bash
-uv run protean skills run -t "Open Calculator and compute 1+1"
-uv run protean skills run -t "..." --overlay
+protean skills run -t "Open Calculator and compute 1+1"
+protean skills run -t "..." --overlay
 ```
 
 Useful for one-off tasks, or to see whether the executor can handle the
@@ -234,7 +237,7 @@ shape of the work before you invest in capturing a skill.
 
 Skills live as directories under your skills directory
 (`PROTEAN_SKILLS_DIR`). Open `SKILL.md` in any editor, change steps /
-verify conditions / idempotency flags, save. `uv run protean skills
+verify conditions / idempotency flags, save. `protean skills
 list` picks up changes immediately.
 
 ### 5. Import another deployment's skill library
@@ -250,7 +253,7 @@ feeds back into `SkillBuilder.refine()`, which uses an LLM to sharpen
 the skill before the next run.
 
 ```bash
-uv run protean skills run my-skill --refine
+protean skills run my-skill --refine
 ```
 
 ### Equip an external agent (Codex / Claude Code)
@@ -267,8 +270,8 @@ that tells the model to load the Protean bootstrap skill at the start
 of every new chat.
 
 ```bash
-uv run protean agents setup codex
-uv run protean agents setup claude_code
+protean agents setup codex
+protean agents setup claude_code
 ```
 
 Re-run the same command after updating Protean to refresh the bootstrap
@@ -281,8 +284,8 @@ don't need to re-run setup by hand.
 To remove Protean from a runtime:
 
 ```bash
-uv run protean agents uninstall codex
-uv run protean agents uninstall all       # every installed runtime
+protean agents uninstall codex
+protean agents uninstall all       # every installed runtime
 ```
 
 Uninstall removes only the Protean-managed skill folders (never
@@ -297,16 +300,16 @@ For a full teardown that also cleans the electron-bridge build, `.venv`,
 ### Running and managing skills
 
 ```bash
-uv run protean skills list                          # list installed skills
-uv run protean skills show SKILL_NAME               # inspect SKILL.md
-uv run protean skills run SKILL_NAME                # replay end-to-end
-uv run protean skills run SKILL_NAME -v             # stream executor events
-uv run protean skills run SKILL_NAME -E claude_code # use Claude Code executor
-uv run protean skills run SKILL_NAME --overlay      # capture-proof overlay
-uv run protean skills run SKILL_NAME -p key=val     # parameterized
+protean skills list                          # list installed skills
+protean skills show SKILL_NAME               # inspect SKILL.md
+protean skills run SKILL_NAME                # replay end-to-end
+protean skills run SKILL_NAME -v             # stream executor events
+protean skills run SKILL_NAME -E claude_code # use Claude Code executor
+protean skills run SKILL_NAME --overlay      # capture-proof overlay
+protean skills run SKILL_NAME -p key=val     # parameterized
 ```
 
-Further flags (run `uv run protean skills run --help` for the full list):
+Further flags (run `protean skills run --help` for the full list):
 
 - `-s / --stepwise` — execute and verify each step individually
   (drives Skill lifecycle § 4 *Validate*).
@@ -433,7 +436,6 @@ Things known to be incomplete:
 
 ## Development
 
-- Use `uv run protean ...`, not bare `python -m protean`.
 - Lint: `uv run ruff check protean tests`.
 - Tests: `uv run pytest` (async tests work without decorators —
   `asyncio_mode = "auto"`).

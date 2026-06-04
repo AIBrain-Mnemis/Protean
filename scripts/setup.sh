@@ -137,12 +137,8 @@ else
     exit 1
   fi
   default_dir="$HOME/.protean"
-  default_url="${PROTEAN_REPO_URL:-https://github.com/AIBrain-Mnemis/Protean.git}"
-  url="$(ask_input "Git URL" "$default_url")"
-  if [ -z "$url" ]; then
-    fail "no git URL provided"
-    exit 1
-  fi
+  url="${PROTEAN_REPO_URL:-https://github.com/AIBrain-Mnemis/Protean.git}"
+  info "Source: $url"
   target="$(ask_input "Clone destination" "$default_dir")"
   if [ -d "$target/.git" ]; then
     pass "$target already cloned, reusing"
@@ -196,6 +192,24 @@ if command -v uv >/dev/null 2>&1; then
 else
   skip "uv missing (see previous step)"
 fi
+
+# ---------- protean shim -------------------------------------------------
+# Install ~/.local/bin/protean so users can run `protean ...` from anywhere
+# instead of `uv --directory ~/.protean run protean ...`.
+step "Install 'protean' command shim"
+SHIM_DIR="$HOME/.local/bin"
+SHIM_PATH="$SHIM_DIR/protean"
+mkdir -p "$SHIM_DIR"
+cat > "$SHIM_PATH" <<EOF
+#!/usr/bin/env bash
+exec uv --directory "$REPO_ROOT" run protean "\$@"
+EOF
+chmod +x "$SHIM_PATH"
+pass "installed $SHIM_PATH → protean (at $REPO_ROOT)"
+case ":$PATH:" in
+  *":$SHIM_DIR:"*) ;;
+  *) warn "$SHIM_DIR is not on your PATH — add it to your shell rc" ;;
+esac
 
 # ---------- .env ---------------------------------------------------------
 step "Bootstrap .env"
@@ -274,7 +288,7 @@ step "Wire external agent runtimes (Codex / Claude Code)"
 wire_agent() {
   local agent="$1"
   info "agents setup $agent …"
-  if uv run protean agents setup "$agent"; then
+  if .venv/bin/protean agents setup "$agent"; then
     pass "wired $agent"
   else
     fail "agents setup $agent failed"
@@ -283,6 +297,8 @@ wire_agent() {
 
 if ! command -v uv >/dev/null 2>&1; then
   skip "uv missing — cannot run 'protean agents setup'"
+elif [ ! -x .venv/bin/protean ]; then
+  skip ".venv/bin/protean missing — uv sync failed?"
 else
   # interactive: ask once per known agent if its home directory exists
   info "Skips an agent automatically when its home directory is absent."
@@ -458,7 +474,7 @@ fi
 echo
 if [ "$FAILED" = "0" ]; then
   printf "${C_BOLD}${C_GREEN}✓ Setup complete.${C_RESET}\n"
-  printf "Next: %suv run protean --help%s\n" "$C_BOLD" "$C_RESET"
+  printf "Next: %sprotean --help%s\n" "$C_BOLD" "$C_RESET"
   exit 0
 else
   printf "${C_BOLD}${C_RED}✗ Setup finished with failures.${C_RESET} Address the FAIL items above and re-run.\n"

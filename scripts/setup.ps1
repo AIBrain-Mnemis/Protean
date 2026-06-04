@@ -107,12 +107,8 @@ if ($CandidateRoot -and (Test-ProteanRepo $CandidateRoot.Path)) {
         exit 1
     }
     $defaultDir = Join-Path $HOME '.protean'
-    $defaultUrl = if ($env:PROTEAN_REPO_URL) { $env:PROTEAN_REPO_URL } else { 'https://github.com/AIBrain-Mnemis/Protean.git' }
-    $url = Ask-Input "Git URL" $defaultUrl
-    if (-not $url) {
-        Write-Fail "no git URL provided"
-        exit 1
-    }
+    $url = if ($env:PROTEAN_REPO_URL) { $env:PROTEAN_REPO_URL } else { 'https://github.com/AIBrain-Mnemis/Protean.git' }
+    Write-Info "Source: $url"
     $target = Ask-Input "Clone destination" $defaultDir
     if (Test-Path (Join-Path $target '.git')) {
         Write-Pass "$target already cloned, reusing"
@@ -163,6 +159,23 @@ if (Test-Cmd 'uv') {
     if ($LASTEXITCODE -eq 0) { Write-Pass "uv sync" } else { Write-Fail "uv sync failed" }
 } else {
     Write-Skip "uv missing (see previous step)"
+}
+
+# ---------- protean shim -------------------------------------------------
+# Install %USERPROFILE%\.local\bin\protean.cmd so users can run `protean ...`
+# from anywhere instead of `uv --directory <repo> run protean ...`.
+Write-Step "Install 'protean' command shim"
+$ShimDir  = Join-Path $env:USERPROFILE '.local\bin'
+$ShimPath = Join-Path $ShimDir 'protean.cmd'
+New-Item -ItemType Directory -Force -Path $ShimDir | Out-Null
+@"
+@echo off
+uv --directory "$RepoRoot" run protean %*
+"@ | Set-Content -Path $ShimPath -Encoding ASCII
+Write-Pass "installed $ShimPath -> protean (at $RepoRoot)"
+$pathDirs = $env:PATH -split ';'
+if ($pathDirs -notcontains $ShimDir) {
+    Write-Warn "$ShimDir is not on your PATH — add it via 'setx PATH `"%PATH%;$ShimDir`"'"
 }
 
 # ---------- .env ---------------------------------------------------------
@@ -242,12 +255,14 @@ Write-Step "Wire external agent runtimes (Codex / Claude Code)"
 function Wire-Agent {
     param([string]$Agent)
     Write-Info "agents setup $Agent ..."
-    & uv run protean agents setup $Agent
+    & .venv\Scripts\protean.exe agents setup $Agent
     if ($LASTEXITCODE -eq 0) { Write-Pass "wired $Agent" } else { Write-Fail "agents setup $Agent failed" }
 }
 
 if (-not (Test-Cmd 'uv')) {
     Write-Skip "uv missing — cannot run 'protean agents setup'"
+} elseif (-not (Test-Path '.venv\Scripts\protean.exe')) {
+    Write-Skip ".venv\Scripts\protean.exe missing — uv sync failed?"
 } else {
     Write-Info "Skips an agent automatically when its home directory is absent."
     $userProfile = $env:USERPROFILE
@@ -426,7 +441,7 @@ Write-Info "Defender / SmartScreen may prompt the first time the electron-bridge
 Write-Host ""
 if (-not $script:Failed) {
     Write-Host "Setup complete." -ForegroundColor Green
-    Write-Host "Next: uv run protean --help" -ForegroundColor White
+    Write-Host "Next: protean --help" -ForegroundColor White
     exit 0
 } else {
     Write-Host "Setup finished with failures. Address the FAIL items above and re-run." -ForegroundColor Red

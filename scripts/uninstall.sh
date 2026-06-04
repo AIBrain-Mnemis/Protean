@@ -32,15 +32,24 @@ FAILED=0
 
 # ---------- 1. unwire external agents -----------------------------------
 step "Unwire external agent runtimes (Codex / Claude Code)"
-if ! command -v uv >/dev/null 2>&1; then
-  skip "uv missing — cannot run 'protean agents uninstall'"
-elif uv run protean agents uninstall all; then
+if [ ! -x .venv/bin/protean ]; then
+  skip ".venv/bin/protean missing — nothing to unwire"
+elif .venv/bin/protean agents uninstall all; then
   pass "agents uninstall all"
 else
   fail "agents uninstall all failed"
 fi
 
-# ---------- 2. electron-bridge build artifacts --------------------------
+# ---------- 2. protean command shim --------------------------------------
+step "Remove 'protean' command shim"
+SHIM_PATH="$HOME/.local/bin/protean"
+if [ -f "$SHIM_PATH" ]; then
+  rm -f "$SHIM_PATH" && pass "removed $SHIM_PATH"
+else
+  skip "$SHIM_PATH not present"
+fi
+
+# ---------- 3. electron-bridge build artifacts --------------------------
 step "Remove electron-bridge build artifacts"
 if [ ! -d electron-bridge ]; then
   skip "electron-bridge/ not present"

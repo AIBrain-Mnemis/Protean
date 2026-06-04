@@ -2,19 +2,12 @@
 
 from __future__ import annotations
 
-import shlex
 from pathlib import Path
 from textwrap import dedent
 
 from protean.skills.schema import Skill, SkillParameter, Step
 
 AGENT_PROTEAN_SKILL_NAME = "build-and-evolve-skills-with-protean"
-
-
-def _command_prefix(protean_root: str | Path | None) -> str:
-    if not protean_root:
-        return ""
-    return f"cd {shlex.quote(str(Path(protean_root).expanduser()))} && "
 
 
 def _terminal_tool(command: str) -> str:
@@ -37,34 +30,33 @@ def build_and_evolve_skills_with_protean_skill(
     The skill is rendered through Protean's normal renderer before being copied
     into Codex, Claude Code, or another agent runtime skill directory.
     """
-    prefix = _command_prefix(protean_root)
     source_var = "{{source}}"
     label_var = "{{label}}"
     task_var = "{{task}}"
     session_var = "{{session}}"
     mark_start = (
-        f'{prefix}uv run protean trajectories mark start '
+        f'protean trajectories mark start '
         f'--source "{source_var}" --label "{label_var}" --task "{task_var}" '
         f'--session "{session_var}"'
     )
     mark_end = (
-        f'{prefix}uv run protean trajectories mark end '
+        f'protean trajectories mark end '
         f'--source "{source_var}" --label "{label_var}" --session "{session_var}"'
     )
     inspect_and_evolve = (
-        f'{prefix}uv run protean trajectories inspect '
+        f'protean trajectories inspect '
         f'--source "{source_var}" --label "{label_var}" --session "{session_var}" && '
-        'uv run protean trajectories evolve '
+        'protean trajectories evolve '
         f'--source "{source_var}" --label "{label_var}" --session "{session_var}" '
         f'--task "{task_var}"'
     )
     inspect_from_message = (
-        f'{prefix}uv run protean trajectories inspect '
+        f'protean trajectories inspect '
         f'--source "{source_var}" --session "{session_var}" '
         '--from-message "<begin user message>" --to-message "<optional end message>"'
     )
     evolve_from_message = (
-        f'{prefix}uv run protean trajectories evolve '
+        f'protean trajectories evolve '
         f'--source "{source_var}" --session "{session_var}" '
         '--from-message "<begin user message>" --to-message "<optional end message>" '
         f'--task "{task_var}"'
@@ -80,9 +72,7 @@ def build_and_evolve_skills_with_protean_skill(
 
         Local assumptions:
 
-        - Repo root: `{repo_root}`
-        - Run Protean CLI commands from that directory.
-        - Use `uv run protean ...`; do not use bare `python` or `python -m protean`.
+        - Repo root: `{repo_root}` (skills/recordings/bridge live here).
         - Skills live under `data/skills` unless `PROTEAN_SKILLS_DIR` overrides it.
         - Recordings live under `data/recordings` unless `PROTEAN_RECORDINGS_DIR`
           overrides it.
@@ -111,29 +101,28 @@ def build_and_evolve_skills_with_protean_skill(
         Useful commands:
 
         ```bash
-        cd {shlex.quote(repo_root)}
-        uv run protean --help
-        uv run protean skills list
-        uv run protean skills show SKILL_NAME
-        uv run protean skills run SKILL_NAME
-        uv run protean skills run SKILL_NAME --refine
-        uv run protean skills run -t "Open Calculator and compute 1+1"
-        uv run protean record -o ./recordings/my-task
-        uv run protean generate ./recordings/my-task -d "Describe the reusable task"
-        uv run protean daemon
+        protean --help
+        protean skills list
+        protean skills show SKILL_NAME
+        protean skills run SKILL_NAME
+        protean skills run SKILL_NAME --refine
+        protean skills run -t "Open Calculator and compute 1+1"
+        protean record -o ./recordings/my-task
+        protean generate ./recordings/my-task -d "Describe the reusable task"
+        protean daemon
         ```
 
         Current-session trajectory evolution commands:
 
         ```bash
-        uv run protean trajectories mark start \\
+        protean trajectories mark start \\
           --source "{source_var}" --label "{label_var}" --task "{task_var}" \\
           --session "{session_var}"
-        uv run protean trajectories mark end \\
+        protean trajectories mark end \\
           --source "{source_var}" --label "{label_var}" --session "{session_var}"
-        uv run protean trajectories inspect \\
+        protean trajectories inspect \\
           --source "{source_var}" --label "{label_var}" --session "{session_var}"
-        uv run protean trajectories evolve \\
+        protean trajectories evolve \\
           --source "{source_var}" --label "{label_var}" --session "{session_var}" \\
           --task "{task_var}"
         ```
@@ -144,7 +133,7 @@ def build_and_evolve_skills_with_protean_skill(
         Follow these operating rules while using Protean:
 
         - If the user only wants to equip this runtime, run
-          `uv run protean agents setup <target>`; setup is not the same as skill use.
+          `protean agents setup <target>`; setup is not the same as skill use.
         - Inspect the current skill or recording before running irreversible workflows.
         - Treat GUI actions that send messages, submit forms, delete data, book rooms,
           or invite attendees as irreversible; ask before the final action unless the
@@ -179,8 +168,8 @@ def build_and_evolve_skills_with_protean_skill(
            around.
         3. **Protean MCP**, used for two distinct purposes:
            - **Skill / trajectory lifecycle** — discovery, show, run, mark,
-             inspect, evolve via `uv run protean skills ...` and
-             `uv run protean trajectories ...`. This work has no native
+             inspect, evolve via `protean skills ...` and
+             `protean trajectories ...`. This work has no native
              equivalent and always belongs to Protean.
            - **GUI fallback** — Protean's accessibility-aware tools
              (`activate_app`, `find_elements`, `click_at`, `type_text`,
@@ -214,7 +203,7 @@ def build_and_evolve_skills_with_protean_skill(
         when_not_to_use=[
             "The task is only casual conversation or a one-line factual answer.",
             "The user only wants to install or copy Protean skills into an agent runtime; use "
-            "`uv run protean agents setup <target>` for setup instead.",
+            "`protean agents setup <target>` for setup instead.",
             "The task contains sensitive or private material and the user has not opted in.",
             "The user wants current-session trajectory evolution, but the agent runtime cannot "
             "provide or identify its current trajectory/session.",

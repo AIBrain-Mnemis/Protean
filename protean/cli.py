@@ -1096,12 +1096,69 @@ def agents_setup(
     click.echo(f"Target: {result.target.display_name}")
     click.echo(f"Skills dir: {result.bootstrap_path.parent.parent}")
     click.echo(f"Agent skill: {result.bootstrap_path}")
+    if result.instructions_path is not None:
+        click.echo(f"Instructions: {result.instructions_path}")
     if result.copied_skills:
         click.echo("Copied Protean skills:")
         for path in result.copied_skills:
             click.echo(f"  {path.name}: {path}")
     else:
         click.echo("No additional Protean skills copied.")
+
+
+@agents.command("uninstall")
+@click.argument(
+    "target",
+    type=click.Choice(["codex", "claude", "claude_code", "all"]),
+)
+@click.pass_context
+def agents_uninstall(
+    ctx: click.Context,
+    target: str,
+) -> None:
+    """Remove Protean skills and managed instructions block from a runtime.
+
+    Pass ``all`` to uninstall from every runtime that has Protean installed.
+    """
+    config: ProteanConfig = ctx.obj["config"]
+    from protean.agent_setup import (
+        installed_agent_targets,
+        managed_skill_names,
+        resolve_agent_target,
+        uninstall_agent,
+    )
+
+    if target == "all":
+        targets = installed_agent_targets()
+        if not targets:
+            click.echo("No installed Protean agent runtimes found.")
+            return
+    else:
+        try:
+            targets = [resolve_agent_target(target)]
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+
+    skill_names = managed_skill_names(config.skills_dir)
+
+    for agent_target in targets:
+        result = uninstall_agent(agent_target, managed_skill_names=skill_names)
+        click.echo(f"Target: {result.target.display_name}")
+        if result.removed_bootstrap is not None:
+            click.echo(f"  Removed bootstrap skill: {result.removed_bootstrap}")
+        else:
+            click.echo("  Bootstrap skill: not installed")
+        if result.removed_skills:
+            click.echo("  Removed Protean skills:")
+            for path in result.removed_skills:
+                click.echo(f"    {path.name}: {path}")
+        else:
+            click.echo("  No additional Protean skills to remove.")
+        if result.instructions_path is not None:
+            verb = "Deleted" if result.instructions_file_deleted else "Cleaned"
+            click.echo(f"  {verb} instructions file: {result.instructions_path}")
+        else:
+            click.echo("  Instructions: no managed block to remove")
 
 
 @main.group()

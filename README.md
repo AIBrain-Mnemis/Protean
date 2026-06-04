@@ -108,32 +108,55 @@ All human-editable, version-controllable, and shareable.
 
 ## Install
 
+The setup script bootstraps everything: clones the repo (if needed),
+offers to install `uv`, runs `uv sync`, creates `.env`, checks
+`ffmpeg`/Node, optionally builds the electron-bridge, and optionally
+wires Codex / Claude Code. Idempotent — safe to re-run for upgrades.
+
+Download and run from anywhere; it will clone Protean into `~/.protean`
+on first run:
+
 ```bash
-git clone <your-fork-url> protean
-cd protean
-uv sync
-cp .env.example .env
+# macOS / Linux
+bash <(curl -fsSL https://raw.githubusercontent.com/AIBrain-Mnemis/Protean/main/scripts/setup.sh)
+
+# Windows (PowerShell)
+iex (irm https://raw.githubusercontent.com/AIBrain-Mnemis/Protean/main/scripts/setup.ps1)
 ```
 
-Fill `.env` with the provider key(s) you intend to use. See
-[`.env.example`](.env.example) for every supported variable. For example:
+If you already cloned the repo manually, just run the script in place —
+it detects the checkout and skips the clone step:
 
-```env
-# Offline skill generation
-OPENAI_API_KEY=...           # or ANTHROPIC_API_KEY, GEMINI_API_KEY, ARK_API_KEY
-
-# Realtime voice session
-GEMINI_API_KEY=...
+```bash
+git clone https://github.com/AIBrain-Mnemis/Protean.git
+cd Protean
+./scripts/setup.sh        # or .\scripts\setup.ps1 on Windows
 ```
 
-Model selection:
+The script is interactive — every optional step (electron-bridge,
+external agent runtimes, provider keys) is a prompt. Press Enter to take
+the default shown in brackets. An existing `.env` is **never
+overwritten**: each provider/realtime/ASR section shows the current
+value and asks whether to change it.
 
-- **Offline generation** — any chat-completions model from a supported
-  provider; set via `*_MODEL` env vars or `-m` on `generate` / `skills run`.
-- **Realtime voice** — Gemini Live, configured via `PROTEAN_REALTIME_MODEL`
-  (e.g. `gemini-3.1-flash-live-preview`).
+To undo what setup did, run the matching teardown script from the
+checkout:
 
-See `protean/config.py` for the in-code default fallbacks.
+```bash
+# macOS / Linux
+./scripts/uninstall.sh
+
+# Windows (PowerShell)
+.\scripts\uninstall.ps1
+```
+
+Non-interactive: it unwires Codex / Claude Code, then removes
+`electron-bridge` build artifacts, `.venv`, `.env`, and the clone
+itself (only when running from `~/.protean`). Shared tools (uv, ffmpeg,
+node) are left alone.
+
+See [`.env.example`](.env.example) for every supported variable and
+[`protean/config.py`](protean/config.py) for the in-code default models.
 
 ## Usage
 
@@ -175,10 +198,8 @@ recording, prompts you for the task description, and chains into
 Talk to a realtime LLM (Gemini Live, via the Electron bridge) and share
 screens in either direction — the agent can watch you work
 (`start_screen(mode="observe")`), or share its own screen for you to
-watch it work (`start_screen(mode="share")`). The bridge has to be built
-first — see
-**[Bridge setup](#bridge-setup-one-time-prerequisite-for-channel-2)**
-below — then start the daemon:
+watch it work (`start_screen(mode="share")`). Build the bridge once with
+`setup.sh` (it prompts), then start the daemon:
 
 ```bash
 uv run protean daemon
@@ -195,10 +216,6 @@ The daemon supervises the bridge subprocess and combines two flows:
 2. **Realtime voice auto-answer** — when a remote user joins the
    configured presence/RTC service, the bridge fires a `ringing` event
    and the daemon auto-starts a `TeachSession`.
-
-If you skip bridge config, the bridge falls back to
-`transport.local_mock` — you can exercise the full session lifecycle
-without a real RTC service.
 
 ### 3. Zero-shot task prompt
 
@@ -235,6 +252,47 @@ the skill before the next run.
 ```bash
 uv run protean skills run my-skill --refine
 ```
+
+### Equip an external agent (Codex / Claude Code)
+
+If you ran `setup.sh` and answered yes when it offered to wire Codex /
+Claude Code, **this is already done** — skip to the re-sync note below.
+
+Otherwise, run `agents setup` to make **Codex** or **Claude Code** invoke
+Protean from inside its own sessions. It copies the local skill library
+into the runtime's skills directory and injects a sentinel-delimited
+block into the runtime's session-start instructions file
+(`~/.codex/AGENTS.md` for Codex, `~/.claude/CLAUDE.md` for Claude Code)
+that tells the model to load the Protean bootstrap skill at the start
+of every new chat.
+
+```bash
+uv run protean agents setup codex
+uv run protean agents setup claude_code
+```
+
+Re-run the same command after updating Protean to refresh the bootstrap
+skill and resync the library — the sentinel block is replaced in place
+without touching the rest of your instructions file. Most pipelines
+(`generate`, `daemon` hotkey, `trajectories evolve`, `skills run
+--refine`) also auto-resync every installed runtime, so you usually
+don't need to re-run setup by hand.
+
+To remove Protean from a runtime:
+
+```bash
+uv run protean agents uninstall codex
+uv run protean agents uninstall all       # every installed runtime
+```
+
+Uninstall removes only the Protean-managed skill folders (never
+user-authored skills sitting alongside) and strips the sentinel block
+from the instructions file, deleting the file entirely if nothing else
+remains. Idempotent and safe to re-run.
+
+For a full teardown that also cleans the electron-bridge build, `.venv`,
+`.env`, and the cloned repo, run [`./scripts/uninstall.sh`](scripts/uninstall.sh)
+(or `scripts\uninstall.ps1` on Windows).
 
 ### Running and managing skills
 
@@ -276,17 +334,7 @@ Protean ships two executor backends; pick with `-E` on `daemon` and
   to it through the in-process MCP surface in
   `protean/executor/mcp.py`. Same tool surface, different driver loop.
 
-### Bridge setup (one-time prerequisite for channel 2)
-
-The realtime path is owned by the `electron-bridge` Node subproject.
-Build it once:
-
-```bash
-cd electron-bridge
-npm install
-npm run build
-cd ..
-```
+### Bridge env vars (channel 2)
 
 Realtime model selection lives in bridge-side env (set in `.env`):
 
@@ -295,12 +343,6 @@ PROTEAN_BRIDGE_REALTIME=gemini
 GEMINI_API_KEY=...
 PROTEAN_REALTIME_MODEL=gemini-3.1-flash-live-preview
 ```
-
-Without `PROTEAN_BRIDGE_REALTIME` or `GEMINI_API_KEY` the bridge falls
-back to a local mock realtime — useful for IPC development without a
-model. Without `PROTEAN_PRESENCE_URL` it also runs in
-`transport.local_mock` mode, so you can exercise the full session
-lifecycle without a real RTC service.
 
 ## Skill lifecycle
 
@@ -374,16 +416,6 @@ Layer roles:
 - **`protean/skills/`** — schema, renderer, registry, builder, runner,
   verifier, refiner.
 
-### Screen modes
-
-The realtime path distinguishes two directions explicitly:
-
-- `start_screen(mode="observe")` — the user shares their screen *to* the agent.
-- `start_screen(mode="share")` — the agent shares its screen *to* the user.
-
-Use `stop_screen()` to end the current mode. The agent receives no
-screenshots until screen handling is started.
-
 ## Roadmap
 
 Things known to be incomplete:
@@ -398,8 +430,6 @@ Things known to be incomplete:
 - **Cross-run skill evolution.** Aggregating trajectories across many runs to
   evolve a skill more aggressively than per-run `refine()`.
 - **Drag toolkit function** — `drag(app, from_label, to_label)`.
-- **Setup wizard / dependency checker** — currently you eyeball
-  `.env.example` and Node/uv installs by hand.
 
 ## Development
 

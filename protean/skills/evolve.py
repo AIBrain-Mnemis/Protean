@@ -13,6 +13,7 @@ Architecture:
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import hashlib
 import json
@@ -429,27 +430,48 @@ class SkillEvolver:
             skills_deleted=[],
         )
 
+        # Dedup by skill_name (keep last — "latest LLM intent wins") to
+        # avoid colliding concurrent writes on the same target. In
+        # practice the router rarely emits multiple actions for one
+        # skill, but the dedup makes the parallel dispatch below safe.
+        deduped: dict[str, EvolveAction] = {}
         for action in decision.actions:
-            try:
-                if action.action == "create":
-                    await self._do_create(
-                        trajectory, action, task_context, result,
+            deduped[action.skill_name] = action
+
+        # Cap fan-out so a router that emits many actions doesn't
+        # open dozens of simultaneous LLM connections. Empirically
+        # 5 keeps wall-clock close to optimal while staying well
+        # under provider per-account concurrent-request limits.
+        sem = asyncio.Semaphore(5)
+
+        async def _dispatch(action: EvolveAction) -> None:
+            async with sem:
+                try:
+                    if action.action == "create":
+                        await self._do_create(
+                            trajectory, action, task_context, result,
+                        )
+                    elif action.action == "refine":
+                        await self._do_refine(trajectory, action, result)
+                    elif action.action == "delete":
+                        self._do_delete(action, result)
+                except Exception:
+                    log.exception(
+                        "evolve: failed to execute action %s on %r",
+                        action.action, action.skill_name,
                     )
-                elif action.action == "refine":
-                    await self._do_refine(trajectory, action, result)
-                elif action.action == "delete":
-                    self._do_delete(action, result)
-            except Exception:
-                log.exception(
-                    "evolve: failed to execute action %s on %r",
-                    action.action, action.skill_name,
-                )
-                result.actions_taken.append({
-                    "action": action.action,
-                    "skill": action.skill_name,
-                    "status": "error",
-                    "reason": action.reason,
-                })
+                    result.actions_taken.append({
+                        "action": action.action,
+                        "skill": action.skill_name,
+                        "status": "error",
+                        "reason": action.reason,
+                    })
+
+        # Run all actions concurrently (bounded by ``sem``). Each
+        # action operates on a distinct skill_name (after dedup), so
+        # file writes don't collide. The shared ``result`` lists are
+        # append-only and list.append is GIL-safe.
+        await asyncio.gather(*(_dispatch(a) for a in deduped.values()))
 
         return result
 

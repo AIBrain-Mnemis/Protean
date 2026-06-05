@@ -13,6 +13,7 @@ A skill starts as a rough sketch from one demonstration. The executor (an AI age
 - Keep skill `name` unchanged. Everything else can be improved.
 - **Preserve figure references.** Keep existing figure refs in steps unless the step's action changed so fundamentally that the figure no longer applies. Only use refs from the available list — do NOT invent new refs.
 - **Precision vs generalizability**: The trajectory is ONE execution on ONE machine. Add details that help the executor find the right element, but keep the skill general (see Generalizability rules in Step fields below). The refined skill must work for ALL future runs.
+- **Do not pollute with concrete instances.** Specific people, rooms, file paths, dates, organization names, and project ids from THIS trajectory must not creep into the skill's ``description``, ``goal``, ``when_to_use``, step actions, or ``success_criteria``. If the original skill is already polluted with such instances, treat removing them as part of this refine.
 - **Bound growth.** Before adding new content to a refine, scan existing sections for compression first: tighten run-on prose in `description`, `goal`, and `verify_condition.description`; fold conditions duplicated across `when_to_use` and `success_criteria`; drop dead clauses. Never drop a `when_to_use` trigger, `success_criteria` bullet, or step `action` detail just to make room.
 
 ## What to look for in the trajectory

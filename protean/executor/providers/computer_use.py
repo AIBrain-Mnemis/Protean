@@ -12,27 +12,31 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import io
 import json
 import logging
 import os
 import re
-import time
 from contextlib import AsyncExitStack
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
-from PIL import Image
-
 from protean.config import DEFAULT_MAX_TOKENS
 from protean.executor import ExecutorContext, ExecutorEvent, ExecutorEventType, ExecutorProvider
+from protean.executor.actions import (
+    GUI_TOOL_NAMES,
+    GUI_TOOL_SPECS,
+    ActionExecutor,
+    ActionResult,
+)
+from protean.executor.providers.prompts import (
+    COMPUTER_USE_SYSTEM_PROMPT,
+    TERMINAL_PROMPT_ADDENDUM,
+)
 from protean.llm import create_sync_client
 from protean.platform.base import (
-    LLM_JPEG_QUALITY,
     LLM_SCREENSHOT_HEIGHT,
     LLM_SCREENSHOT_WIDTH,
     CoordinateMapper,
-    parse_key_combo,
 )
 
 if TYPE_CHECKING:
@@ -51,180 +55,70 @@ log = logging.getLogger(__name__)
 # scaling in _DisplayScale, or downscale uniformly + letterbox.
 # Also note: the strings "1024x768", "0-1023", "0-767" are hard-coded in tool
 # descriptions and the system prompt below — when this is fixed, those must
-# be templated off these constants too.
-_DEFAULT_DISPLAY_WIDTH = 1024
-_DEFAULT_DISPLAY_HEIGHT = 768
-_JPEG_QUALITY = 70
+# be templated off ``LLM_SCREENSHOT_WIDTH``/``LLM_SCREENSHOT_HEIGHT`` too.
 _MAX_ITERATIONS = 500
 _REASONING_TRUNCATE = 500
-# Pixel spacing of the coordinate grid drawn on the detail-crop view.
-_DETAIL_GRID_STEP = 100
 
 
 # ── Tool definitions (standard function tools) ──────────────
+#
+# GUI actions (screenshot, click, type, etc.) come from
+# ``protean.executor.actions.GUI_TOOL_SPECS`` so the Anthropic /
+# OpenAI function-tool list, the MCP server tool list, and
+# ``ActionExecutor.dispatch`` all stay in lockstep — adding a tool in
+# one place propagates everywhere. Only computer_use-specific tools
+# (``done``, optional terminal tools) live in this file.
 
-_BASE_TOOLS: list[dict[str, Any]] = [
-    {
-        "name": "screenshot",
-        "description": (
-            "Take a screenshot of the current screen. Returns the image. "
-            "Call this first to see what's on screen before acting."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
-    },
-    {
-        "name": "left_click",
-        "description": (
-            "Click the left mouse button at the given (x, y) pixel coordinates. "
-            "Coordinates are relative to the screenshot image (1024x768)."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "x": {"type": "integer", "description": "X coordinate (0-1023)"},
-                "y": {"type": "integer", "description": "Y coordinate (0-767)"},
-            },
-            "required": ["x", "y"],
-        },
-    },
-    {
-        "name": "right_click",
-        "description": "Right-click at the given (x, y) pixel coordinates.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "x": {"type": "integer", "description": "X coordinate"},
-                "y": {"type": "integer", "description": "Y coordinate"},
-            },
-            "required": ["x", "y"],
-        },
-    },
-    {
-        "name": "double_click",
-        "description": "Double-click the left mouse button at (x, y).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "x": {"type": "integer", "description": "X coordinate"},
-                "y": {"type": "integer", "description": "Y coordinate"},
-            },
-            "required": ["x", "y"],
-        },
-    },
-    {
-        "name": "mouse_move",
-        "description": "Move the mouse cursor to (x, y) without clicking.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "x": {"type": "integer", "description": "X coordinate"},
-                "y": {"type": "integer", "description": "Y coordinate"},
-            },
-            "required": ["x", "y"],
-        },
-    },
-    {
-        "name": "type_text",
-        "description": (
-            "Type the given text string. The text is typed character by character "
-            "into whatever field currently has focus. Use left_click first to focus "
-            "the target input field."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "Text to type"},
-            },
-            "required": ["text"],
-        },
-    },
-    {
-        "name": "key_press",
-        "description": (
-            "Press a key or key combination. Examples: 'return', 'tab', 'escape', "
-            "'cmd+c', 'cmd+v', 'cmd+a', 'ctrl+c', 'alt+tab', 'shift+tab', "
-            "'cmd+shift+n', 'up', 'down', 'left', 'right', 'backspace', 'delete', "
-            "'space', 'cmd+w', 'cmd+q'."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "keys": {
-                    "type": "string",
-                    "description": "Key or combo, e.g. 'return', 'cmd+c', 'alt+tab'",
-                },
-            },
-            "required": ["keys"],
-        },
-    },
-    {
-        "name": "scroll",
-        "description": (
-            "Scroll at the given (x, y) position. Direction can be 'up', 'down', "
-            "'left', or 'right'. Amount is the number of scroll steps (default 3)."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "x": {"type": "integer", "description": "X coordinate to scroll at"},
-                "y": {"type": "integer", "description": "Y coordinate to scroll at"},
-                "direction": {
-                    "type": "string",
-                    "enum": ["up", "down", "left", "right"],
-                    "description": "Scroll direction",
-                },
-                "amount": {
-                    "type": "integer",
-                    "description": "Number of scroll steps (default 3)",
-                },
-            },
-            "required": ["x", "y", "direction"],
-        },
-    },
-    {
-        "name": "wait",
-        "description": "Wait for the given number of seconds (e.g. for loading).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "seconds": {
-                    "type": "number",
-                    "description": "Seconds to wait (default 2)",
-                },
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "done",
-        "description": (
-            "Call this when the task is complete. Include a brief summary of "
-            "what was accomplished."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "summary": {
-                    "type": "string",
-                    "description": "Brief summary of what was done",
-                },
-            },
-            "required": ["summary"],
-        },
-    },
-]
+_GUI_TOOLS: list[dict[str, Any]] = [spec.to_function_tool() for spec in GUI_TOOL_SPECS]
 
-_TOOLS_BY_NAME: dict[str, dict[str, Any]] = {tool["name"]: tool for tool in _BASE_TOOLS}
+# ``done`` is loop control: signals the agentic loop to break with the
+# given summary. Not exposed via MCP (external CLI agents have their
+# own task-complete signals — Claude Code's ResultMessage, Codex's
+# stop reason).
+_DONE_TOOL: dict[str, Any] = {
+    "name": "done",
+    "description": (
+        "Call this when the task is complete. Include a brief summary of "
+        "what was accomplished."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "Brief summary of what was done",
+            },
+        },
+        "required": ["summary"],
+    },
+}
 
 
-# Optional terminal tool — appended to per-instance tool list when
-# ComputerUseExecutor is constructed with enable_terminal=True. Backed by
-# the DesktopCommanderMCP server (https://github.com/wonderwhy-er/DesktopCommanderMCP)
-# launched over stdio.
+# ── Terminal tools ──────────────────────────────────────────
+#
+# TODO: the terminal toolset is weirdly placed.
+#   - The "MCP-in-MCP" smell is real: we spawn DesktopCommanderMCP as
+#     a subprocess and proxy two tools (run_terminal_command,
+#     send_terminal_input) into our own function-tool surface. But
+#     these tools are computer_use-only — external CLI agents have
+#     their own Bash tools, so they're NOT exposed via
+#     ``protean.mcp.server``.
+#   - DesktopCommander gives us PID tracking, idle detection,
+#     interactive-prompt detection, output-size watchdog, and
+#     force_terminate for free. Reimplementing on top of native
+#     ``asyncio.create_subprocess_exec`` is one to two hundred lines
+#     of subprocess plumbing.
+#   - Two cleanup options when we revisit:
+#       (a) Replace DesktopCommander with a native ActionExecutor
+#           method (e.g. ``run_command()``) so terminal tools become
+#           regular ActionResult-returning actions like the rest.
+#       (b) Drop the proxy entirely and require the caller to set up
+#           their own terminal MCP (matches how Bash works in
+#           Claude Code today).
+#   - Until then, keep these tools / the _TerminalMCP wrapper /
+#     _TERMINAL_PROMPT_ADDENDUM here. They are not part of the shared
+#     GUI tool surface.
+
 _TERMINAL_TOOL: dict[str, Any] = {
     "name": "run_terminal_command",
     "description": (
@@ -301,53 +195,6 @@ _SEND_INPUT_TOOL: dict[str, Any] = {
     },
 }
 
-_TERMINAL_PROMPT_ADDENDUM = """\
-
-TERMINAL ACCESS — READ THIS BEFORE EXECUTING ANY SKILL:
-
-You have two terminal tools:
-
-1. `run_terminal_command(command, timeout_seconds?, shell?)` — runs a shell
-   command in a hidden background process. The command starts immediately
-   and you get back its PID plus any initial output. The process keeps running
-   in the background — you will be NOTIFIED automatically when it:
-     - finishes (with exit code and output)
-     - goes idle (no output for ~30s — may be hung or waiting for input)
-     - is waiting for interactive input (e.g. Password:, [Y/n])
-     - produces too much output (terminated to prevent disk fill)
-
-2. `send_terminal_input(pid, input)` — sends text to a running process's
-   stdin. Use this to respond to interactive prompts (Password:, [Y/n],
-   etc.). A newline (Enter) is appended automatically, e.g. input="y".
-
-There is NO visible terminal window — nothing appears on the user's screen.
-However, a screenshot is included with every result, because some commands
-may trigger visual popups (e.g. permission dialogs, Keychain auth).
-
-DECIDE BEFORE ACTING:
-  - If the user's actual goal is to READ information from the system
-    (list files / check status / read logs / get version / inspect
-    config), you MUST use run_terminal_command and skip the GUI flow.
-    Example: task "list files in /tmp" → just call
-      run_terminal_command(command="ls -la /tmp")
-    and report the output. Do NOT open a terminal app or any GUI
-    even if the SKILL.md describes that flow.
-  - If the goal genuinely requires GUI interaction (sending a Teams
-    message, scheduling an Outlook meeting, clicking a Settings
-    toggle), follow the SKILL.md GUI steps as usual.
-  - For long-running commands (builds, installs, large downloads),
-    run_terminal_command is fine — the process runs in background and
-    you'll be notified when it completes. You can continue doing other
-    work while waiting.
-  - When a task involves repetitive operations on multiple items
-    (processing rows in a spreadsheet, batch renaming files, checking
-    rules across entries), write a script and run it via
-    run_terminal_command instead of repeating GUI actions one by one.
-
-When in doubt: if the answer to the user's question is text that a
-shell command would print, use run_terminal_command.
-"""
-
 
 # Default command for spawning the DesktopCommanderMCP server.
 _DEFAULT_MCP_TERMINAL_COMMAND: list[str] = [
@@ -376,86 +223,6 @@ _INTERACTIVE_PROMPT_RE = re.compile(
     r"|(?:passphrase\s*[:\>])"
     r"|(?:yes/no\)?\s*[:\>]?\s*$)"
 )
-
-
-_SYSTEM_PROMPT = """\
-You are a GUI automation agent. You interact with a computer using screenshots and action tools.
-
-CORE RULES:
-1. Always call `screenshot` first to observe the current UI state.
-2. Every action tool (left_click, type_text, key_press, etc.) returns a new screenshot — do NOT call screenshot again immediately after an action.
-3. Coordinate-based actions also return a **detail view**: a 2× zoomed crop around the action point with a coordinate grid overlay (100 px spacing). Use the detail view to verify you clicked the correct element and to read nearby coordinates precisely.
-4. Coordinates are in screenshot space (1024x768):
-   - (0, 0) is the top-left corner of the screen
-   - x increases to the right
-   - y increases downward
-   - Click targets should be the visual center of UI elements
-5. Carefully read all visible text and UI elements before acting.
-
-INTERACTION RULES:
-6. To type into a field, click it first to ensure focus.
-7. Detect the operating system from the screenshot:
-   - Windows → use `ctrl`
-   - macOS → use `cmd`
-8. To open applications:
-   - Windows: press `key_press('win')`, type app name, then `key_press('return')`
-   - macOS: press `key_press('cmd+space')`, type app name, then `key_press('return')`
-   Wait 2-3 seconds for applications to load before interacting.
-
-**ERROR HANDLING (CRITICAL)**:
-9. Every coordinate-based tool (e.g. left_click) must follow this exact schema: {"x": <int>, "y": <int>}. Never use formats like "x, y", "(x, y)".
-10. If a click does not produce the expected result (e.g. clicked a wrong element, close the window by mistake), explicitly follow below steps to self-correct in your reasoning and try again:
-   a. Recall the exact coordinates you clicked (x, y).
-   b. Identify what UI element was actually clicked at that location.
-   c. Determine the spatial relation between clicked point and target:
-      - target is LEFT / RIGHT / ABOVE / BELOW relative to clicked position
-   d. Infer correction direction using the same 1024x768 screenshot coordinate space:
-      - If target is LEFT → decrease x
-      - If target is RIGHT → increase x
-      - If target is ABOVE → decrease y
-      - If target is BELOW → increase y
-   e. On next attempt, adjust coordinates accordingly and re-click.
-11. Each correction must change the click position meaningfully. Do not repeat identical coordinates.
-
-EFFICIENCY:
-12. Batch independent tool actions into a single response when later actions do not require observing the result of earlier ones. This reduces round trips and speeds execution. Only the final tool call in a batch returns a screenshot; earlier calls return text-only confirmations.
-
-Good candidates for batching:
-- type_text, then key_press("return")
-- repeated key presses for navigation (Tab, Shift-Tab, Arrow keys)
-- click, then wait
-- focus a field, then type_text
-- scroll multiple increments
-- open a menu, then wait for animation/loading
-- escape to dismiss, then re-click a known target (retry/correction)
-
-Do not batch actions when a later action depends on updated visual state, changed layout, new content, validation messages, popups, focus changes, or uncertain element positions.
-
-Examples to avoid batching:
-- click Search, then click a result that has not appeared yet
-- submit a form, then click where a confirmation button should appear
-- open a dropdown, then choose an option before seeing the menu
-- close a modal, then click an underlying button without confirming the screen state
-- click a tab, then interact with content that may load differently
-
-13. For deterministic non-visual operations (file edits, system checks, data transforms, script execution), prefer `run_terminal_command` over GUI interaction. Keep GUI for tasks that depend on visual interpretation or UI state.
-
-COMPLETION:
-14. When the task is fully completed, call the `done` tool with a concise summary of what was achieved.
-
-SCREEN-SHARE AWARENESS:
-15. If the Context contains `user_visible_surface: ...`, the human user is
-    currently watching that surface through screen-sharing. Your screenshots
-    must match what they see — otherwise you will narrate things they
-    cannot see and your guidance will be wrong.
-16. On the first screenshot after that notice (or after any "[user-visible
-    surface changed]" follow-up), briefly describe what you see and ask
-    the user whether the view matches their screen.
-17. If the user says it doesn't match, do not keep clicking blindly. Take
-    another screenshot, describe it again, and keep iterating until you
-    both agree on the visible surface.
-18. When no `user_visible_surface` line is present, behave normally.
-""" # noqa: E501
 
 
 class ComputerUseExecutor(ExecutorProvider):
@@ -495,13 +262,14 @@ class ComputerUseExecutor(ExecutorProvider):
             base_url=base_url,
         )
 
-        # Per-instance tool list — extends _BASE_TOOLS with optional MCP-backed tools.
+        # Per-instance tool list = shared GUI tools + loop-control
+        # (done) + optional terminal proxies.
         self._enable_terminal = enable_terminal
         self._mcp_terminal_command = (
             list(mcp_terminal_command) if mcp_terminal_command
             else list(_DEFAULT_MCP_TERMINAL_COMMAND)
         )
-        self._tools: list[dict[str, Any]] = list(_BASE_TOOLS)
+        self._tools: list[dict[str, Any]] = [*_GUI_TOOLS, _DONE_TOOL]
         if enable_terminal:
             self._tools.append(_TERMINAL_TOOL)
             self._tools.append(_SEND_INPUT_TOOL)
@@ -530,14 +298,20 @@ class ComputerUseExecutor(ExecutorProvider):
         self._display_width = display_width
         self._display_height = display_height
         self._max_iterations = max_iterations
-        base_prompt = system_prompt or _SYSTEM_PROMPT
+        base_prompt = system_prompt or COMPUTER_USE_SYSTEM_PROMPT
         if enable_terminal:
-            base_prompt = base_prompt + _TERMINAL_PROMPT_ADDENDUM
+            base_prompt = base_prompt + TERMINAL_PROMPT_ADDENDUM
         self._system_prompt = base_prompt
 
         self._event_queue: asyncio.Queue[ExecutorEvent] = asyncio.Queue()
         self._loop_task: asyncio.Task | None = None
         self._coords = CoordinateMapper(platform, display_width, display_height)
+        # Shared GUI action layer — same primitives are exposed to external
+        # CLI agents via protean.mcp. This is the single source of
+        # truth for "post-action screenshot" + detail-crop behavior.
+        # ActionExecutor reads display_width/height from the mapper so
+        # passing them again here would be redundant.
+        self._actions = ActionExecutor(platform, self._coords)
         self._cancelled = False
         self._image_keep_last = image_keep_last
         self._messages: list[dict[str, Any]] = []
@@ -563,7 +337,7 @@ class ComputerUseExecutor(ExecutorProvider):
 
         # Lock onto the active display so the first coord-taking tool call
         # (which may run before the model's first screenshot) maps to the
-        # right monitor. _take_screenshot refreshes this on every capture.
+        # right monitor. ActionExecutor.take_screenshot() refreshes this on every capture.
         self._coords.refresh()
 
         self._cancelled = False
@@ -846,7 +620,7 @@ class ComputerUseExecutor(ExecutorProvider):
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": result,
+                        "content": self._result_to_anthropic(result),
                     })
 
             # Append assistant response to message history
@@ -999,7 +773,7 @@ class ComputerUseExecutor(ExecutorProvider):
 
             # Process function calls
             tool_result_items: list[dict[str, Any]] = []
-            screenshot_b64: str | None = None
+            trailing_image_blocks: list[dict[str, Any]] = []
 
             for i, fc in enumerate(function_calls):
                 tool_name = fc.name
@@ -1038,17 +812,17 @@ class ComputerUseExecutor(ExecutorProvider):
                     include_screenshot=is_last_tool,
                 )
 
-                text_parts = [r["text"] for r in result if r.get("type") == "text"]
-                if is_last_tool:
-                    for r in result:
-                        if r.get("type") == "image":
-                            screenshot_b64 = r["source"]["data"]
-
                 tool_result_items.append({
                     "type": "function_call_output",
                     "call_id": fc.call_id,
-                    "output": "\n".join(text_parts) or "OK",
+                    "output": self._result_text_for_openai(result),
                 })
+                # Only the last tool's images travel as a follow-up user
+                # message — earlier batched tools are intentionally
+                # text-only (matches the Anthropic path's
+                # ``include_screenshot=is_last_tool`` contract).
+                if is_last_tool:
+                    trailing_image_blocks = self._result_images_for_openai(result)
 
             # Append response output items to history for next turn
             for item in output_items:
@@ -1068,17 +842,12 @@ class ComputerUseExecutor(ExecutorProvider):
             # Append tool results
             messages.extend(tool_result_items)
 
-            # Append screenshot as user message so model can see the screen
-            if screenshot_b64:
+            # Append the last tool's screenshots as a user message
+            # (function_call_output is text-only).
+            if trailing_image_blocks:
                 messages.append({
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:image/jpeg;base64,{screenshot_b64}",
-                            "detail": "auto",
-                        },
-                    ],
+                    "content": trailing_image_blocks,
                 })
 
         token_summary = self._format_token_summary(
@@ -1237,18 +1006,6 @@ class ComputerUseExecutor(ExecutorProvider):
             parts.append(f"cache: {cache_creation:,} created, {cache_read:,} read")
         return "Token usage: " + " | ".join(parts)
 
-    def _safe_int(self, value: Any) -> int:
-        """Convert value to int, handling strings like '512, 384'."""
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float):
-            return int(round(value))
-        s = str(value).strip()
-        # Handle malformed values like "955, 332" — take first number
-        if "," in s:
-            s = s.split(",")[0].strip()
-        return int(s)
-
     @staticmethod
     def _format_tool_input(input_data: dict[str, Any]) -> str:
         return json.dumps(input_data, ensure_ascii=True, sort_keys=True)
@@ -1288,289 +1045,134 @@ class ComputerUseExecutor(ExecutorProvider):
             parts.append(f"Hint: {self._tool_error_hint(name, input_data)}.")
         return " ".join(parts)
 
-    async def _screenshot_result(self) -> dict[str, Any]:
-        """Take a screenshot and return it as an image content block."""
-        screenshot_b64 = await self._take_screenshot()
-        return {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/jpeg",
-                "data": screenshot_b64,
-            },
-        }
+    @staticmethod
+    def _result_to_anthropic(r: ActionResult) -> list[dict[str, Any]]:
+        """Translate an ActionResult into Anthropic ``tool_result`` content.
 
-    def _detail_crop(self, cx: int, cy: int) -> dict[str, Any] | None:
-        """Crop a 2x-zoomed detail view around (cx, cy) with coordinate grid.
-
-        Uses self._last_screenshot_img (set by _take_screenshot).
-        Returns an image content block, or None if no screenshot is cached.
-
-        The crop is a square of side `max(width, height) / 4` centered
-        on the click — ~25% of the screen's longest dimension. Grid
-        step is the module-level constant `_DETAIL_GRID_STEP`.
+        Anthropic accepts an interleaved list of text and image blocks
+        directly inside ``tool_result.content``. Order:
+        text → screenshot → detail caption → detail crop.
         """
-        from PIL import ImageDraw, ImageFont
-
-        img = getattr(self, "_last_screenshot_img", None)
-        if img is None:
-            return None
-
-        crop_r = max(1, max(self._display_width, self._display_height) // 8)
-        step = _DETAIL_GRID_STEP
-        W, H = img.size
-        x1, y1 = max(0, cx - crop_r), max(0, cy - crop_r)
-        x2, y2 = min(W, cx + crop_r), min(H, cy + crop_r)
-        crop = img.crop((x1, y1, x2, y2))
-
-        cw, ch = crop.size
-        crop = crop.resize((cw * 2, ch * 2), Image.LANCZOS)  # type: ignore[attr-defined]
-        draw = ImageDraw.Draw(crop)
-
-        font = ImageFont.load_default()
-
-        for gx in range((x1 // step) * step, x2 + 1, step):
-            sx = (gx - x1) * 2
-            if 0 <= sx <= cw * 2:
-                draw.line([(sx, 0), (sx, ch * 2)], fill="red", width=1)
-                txt = str(gx)
-                bbox = font.getbbox(txt)
-                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                draw.rectangle([(sx + 1, 0), (sx + 1 + tw + 4, th + 4)], fill="white")
-                draw.text((sx + 3, 1), txt, fill="black", font=font)
-
-        for gy in range((y1 // step) * step, y2 + 1, step):
-            sy = (gy - y1) * 2
-            if 0 <= sy <= ch * 2:
-                draw.line([(0, sy), (cw * 2, sy)], fill="red", width=1)
-                txt = str(gy)
-                bbox = font.getbbox(txt)
-                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                draw.rectangle([(0, sy + 1), (tw + 4, sy + 1 + th + 4)], fill="white")
-                draw.text((2, sy + 2), txt, fill="black", font=font)
-
-        buf = io.BytesIO()
-        crop.save(buf, "JPEG", quality=LLM_JPEG_QUALITY, optimize=True)
-        b64 = base64.standard_b64encode(buf.getvalue()).decode()
-        return {
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
-        }
-
-    def _coord_result(
-        self, action: str, ix: int, iy: int, screenshot: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        """Build tool_result blocks for a coordinate-based action.
-
-        Returns: [text, full_screenshot, detail_caption, detail_image].
-        """
-        blocks: list[dict[str, Any]] = [
-            {"type": "text", "text": f"{action}. Result screenshot below."},
-            screenshot,
-        ]
-        detail = self._detail_crop(ix, iy)
-        if detail is not None:
-            W, H = self._display_width, self._display_height
-            crop_r = max(1, max(self._display_width, self._display_height) // 8)
-            x1, y1 = max(0, ix - crop_r), max(0, iy - crop_r)
-            x2, y2 = min(W, ix + crop_r), min(H, iy + crop_r)
+        blocks: list[dict[str, Any]] = []
+        if r.text:
+            blocks.append({"type": "text", "text": r.text})
+        if r.screenshot_b64:
             blocks.append({
-                "type": "text",
-                "text": (
-                    f"[Detail view around ({ix}, {iy})"
-                    f" — region x={x1}..{x2}, y={y1}..{y2},"
-                    f" with coordinate grid overlay]"
-                ),
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": r.screenshot_b64,
+                },
             })
-            blocks.append(detail)
+        if r.detail_caption:
+            blocks.append({"type": "text", "text": r.detail_caption})
+        if r.detail_crop_b64:
+            blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": r.detail_crop_b64,
+                },
+            })
+        return blocks
+
+    @staticmethod
+    def _result_text_for_openai(r: ActionResult) -> str:
+        """Collapse text + detail caption into one string.
+
+        OpenAI's ``function_call_output`` only accepts a single ``output``
+        string; images travel as a separate user message (see
+        ``_result_images_for_openai``).
+        """
+        parts = [t for t in (r.text, r.detail_caption) if t]
+        return "\n".join(parts) or "OK"
+
+    @staticmethod
+    def _result_images_for_openai(r: ActionResult) -> list[dict[str, Any]]:
+        """OpenAI Responses ``input_image`` blocks for the result's screenshots.
+
+        Returns both the full screenshot and the detail crop when present.
+        Callers wrap these in a ``{"role": "user", "content": [...]}``
+        message because OpenAI doesn't allow images inside
+        ``function_call_output``.
+        """
+        blocks: list[dict[str, Any]] = []
+        for b64 in (r.screenshot_b64, r.detail_crop_b64):
+            if b64:
+                blocks.append({
+                    "type": "input_image",
+                    "image_url": f"data:image/jpeg;base64,{b64}",
+                    "detail": "auto",
+                })
         return blocks
 
     async def _execute_tool(
         self, name: str, input_data: dict[str, Any],
         *, include_screenshot: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Execute a tool call and return content blocks for the tool_result.
+    ) -> ActionResult:
+        """Execute a tool call and return its provider-neutral result.
 
-        Every action automatically includes a post-action screenshot so the
-        model doesn't need to call screenshot separately after each action.
+        GUI actions delegate to ``ActionExecutor.dispatch``; the only
+        tools handled here are the ones unique to this executor
+        (``run_terminal_command`` / ``send_terminal_input``). ``done``
+        is loop control and is handled by ``_run_anthropic_loop`` /
+        ``_run_openai_loop`` directly, so it never reaches this method.
+
+        Every GUI action automatically includes a post-action screenshot
+        (driven by ``ActionExecutor``) so the model doesn't need to call
+        screenshot separately after each action.
         """
         try:
-            if name == "screenshot":
-                return [await self._screenshot_result()]
-
-            elif name == "left_click":
-                ix, iy = self._safe_int(input_data["x"]), self._safe_int(input_data["y"])
-                x, y = self._coords.to_actual(ix, iy)
-                self._platform.click(x, y)
-                await asyncio.sleep(0.5)
-                if not include_screenshot:
-                    return [{"type": "text", "text": f"Clicked at ({ix}, {iy})"}]
-                ss = await self._screenshot_result()
-                return self._coord_result(f"Clicked at ({ix}, {iy})", ix, iy, ss)
-
-            elif name == "right_click":
-                ix, iy = self._safe_int(input_data["x"]), self._safe_int(input_data["y"])
-                x, y = self._coords.to_actual(ix, iy)
-                self._platform.click(x, y, button="right")
-                await asyncio.sleep(0.5)
-                if not include_screenshot:
-                    return [{"type": "text", "text": f"Right-clicked at ({ix}, {iy})"}]
-                ss = await self._screenshot_result()
-                return self._coord_result(f"Right-clicked at ({ix}, {iy})", ix, iy, ss)
-
-            elif name == "double_click":
-                ix, iy = self._safe_int(input_data["x"]), self._safe_int(input_data["y"])
-                x, y = self._coords.to_actual(ix, iy)
-                self._platform.double_click(x, y)
-                await asyncio.sleep(0.5)
-                if not include_screenshot:
-                    return [{"type": "text", "text": f"Double-clicked at ({ix}, {iy})"}]
-                ss = await self._screenshot_result()
-                return self._coord_result(f"Double-clicked at ({ix}, {iy})", ix, iy, ss)
-
-            elif name == "mouse_move":
-                ix, iy = self._safe_int(input_data["x"]), self._safe_int(input_data["y"])
-                x, y = self._coords.to_actual(ix, iy)
-                self._platform.move_cursor(x, y)
-                await asyncio.sleep(0.2)
-                if not include_screenshot:
-                    return [{"type": "text", "text": f"Moved cursor to ({ix}, {iy})"}]
-                ss = await self._screenshot_result()
-                return self._coord_result(f"Moved cursor to ({ix}, {iy})", ix, iy, ss)
-
-            elif name == "type_text":
-                text = input_data["text"]
-                self._platform.type_text(text)
-                await asyncio.sleep(0.5)
-                if not include_screenshot:
-                    return [{"type": "text", "text": f"Typed: {text!r}"}]
-                return [
-                    {"type": "text", "text": f"Typed: {text!r}"},
-                    await self._screenshot_result(),
-                ]
-
-            elif name == "key_press":
-                keys_str = input_data["keys"]
-                keys = parse_key_combo(keys_str)
-                self._platform.key_press(*keys)
-                await asyncio.sleep(0.5)
-                if not include_screenshot:
-                    return [{"type": "text", "text": f"Pressed: {keys_str}"}]
-                return [
-                    {"type": "text", "text": f"Pressed: {keys_str}"},
-                    await self._screenshot_result(),
-                ]
-
-            elif name == "scroll":
-                ix, iy = self._safe_int(input_data["x"]), self._safe_int(input_data["y"])
-                x, y = self._coords.to_actual(ix, iy)
-                direction = input_data["direction"]
-                amount = input_data.get("amount", 3)
-                self._platform.scroll(x, y, direction, amount)
-                await asyncio.sleep(0.3)
-                if not include_screenshot:
-                    return [{
-                        "type": "text",
-                        "text": f"Scrolled {direction} {amount} steps at ({ix}, {iy})"
-                    }]
-                ss = await self._screenshot_result()
-                return self._coord_result(
-                    f"Scrolled {direction} {amount} steps at ({ix}, {iy})",
-                    ix, iy, ss,
+            if name in GUI_TOOL_NAMES:
+                return await self._actions.dispatch(
+                    name, input_data, include_screenshot=include_screenshot,
                 )
-
-            elif name == "wait":
-                seconds = input_data.get("seconds", 2)
-                await asyncio.sleep(seconds)
-                if not include_screenshot:
-                    return [{"type": "text", "text": f"Waited {seconds}s"}]
-                return [
-                    {"type": "text", "text": f"Waited {seconds}s"},
-                    await self._screenshot_result(),
-                ]
 
             elif name == "run_terminal_command":
                 if not self._enable_terminal:
-                    return [{"type": "text", "text": (
-                        "run_terminal_command is not enabled for this executor."
-                    )}]
+                    return ActionResult(
+                        text="run_terminal_command is not enabled for this executor."
+                    )
                 cmd = input_data["command"]
                 timeout = float(input_data.get("timeout_seconds", 30))
                 shell = input_data.get("shell")
                 terminal = await self._ensure_terminal()
                 output = await terminal.start_command(cmd, timeout, shell)
                 if not include_screenshot:
-                    return [{"type": "text", "text": output}]
+                    return ActionResult(text=output)
                 await asyncio.sleep(0.5)
-                return [
-                    {"type": "text", "text": output},
-                    await self._screenshot_result(),
-                ]
+                return ActionResult(
+                    text=output,
+                    screenshot_b64=self._actions.take_screenshot(),
+                )
 
             elif name == "send_terminal_input":
                 if not self._enable_terminal:
-                    return [{"type": "text", "text": (
-                        "send_terminal_input is not enabled for this executor."
-                    )}]
+                    return ActionResult(
+                        text="send_terminal_input is not enabled for this executor."
+                    )
                 pid = int(input_data["pid"])
                 text = input_data["input"]
                 terminal = await self._ensure_terminal()
                 output = await terminal.send_input(pid, text)
                 if not include_screenshot:
-                    return [{"type": "text", "text": output}]
+                    return ActionResult(text=output)
                 await asyncio.sleep(0.5)
-                return [
-                    {"type": "text", "text": output},
-                    await self._screenshot_result(),
-                ]
+                return ActionResult(
+                    text=output,
+                    screenshot_b64=self._actions.take_screenshot(),
+                )
 
             else:
-                return [{"type": "text", "text": f"Unknown tool: {name}"}]
+                return ActionResult(text=f"Unknown tool: {name}")
 
         except Exception as e:
             log.error("Tool %s failed: %s", name, e, exc_info=True)
-            return [{"type": "text", "text": self._format_tool_error(name, input_data, e)}]
+            return ActionResult(text=self._format_tool_error(name, input_data, e))
 
     # ── Helpers ──────────────────────────────────────────
-
-    async def _take_screenshot(self) -> str:
-        """Capture screen, resize, encode as JPEG base64.
-
-        Also stores the resized PIL Image in self._last_screenshot_img
-        so _detail_crop can produce a zoomed detail view without
-        re-capturing.
-        """
-        import tempfile
-        from pathlib import Path
-
-        from protean.platform.base import prepare_screenshot_for_llm
-
-        tmp = Path(tempfile.gettempdir()) / f"protean_cu_screenshot_{time.monotonic_ns()}.png"
-
-        # Re-detect the active display each time so moving windows between
-        # monitors mid-task is handled.
-        self._coords.refresh()
-        display_index = self._coords.display_index
-
-        self._platform.capture_display(display_index, tmp)
-        raw_bytes = tmp.read_bytes()
-        tmp.unlink(missing_ok=True)
-
-        # Resize to exact API coordinate space + compress
-        jpeg_bytes, _ = prepare_screenshot_for_llm(
-            raw_bytes,
-            max_width=self._display_width,
-            max_height=self._display_height,
-            quality=LLM_JPEG_QUALITY,
-            exact_size=True,
-        )
-
-        # Keep resized PIL Image for detail crop
-        self._last_screenshot_img = Image.open(io.BytesIO(jpeg_bytes)).copy()
-
-        b64 = base64.standard_b64encode(jpeg_bytes).decode()
-        log.debug("Screenshot: %d bytes base64", len(b64))
-        return b64
 
     @staticmethod
     def _serialize_block(block: Any) -> dict[str, Any]:

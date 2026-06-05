@@ -84,8 +84,7 @@ def _sync_installed_agents(config: ProteanConfig) -> list[str]:
     """
     from protean.agent_setup import sync_installed_agents
 
-    protean_root = Path(__file__).resolve().parents[1]
-    results = sync_installed_agents(config.skills_dir, protean_root=protean_root)
+    results = sync_installed_agents(config.skills_dir)
     return [r.target.display_name for r in results]
 
 
@@ -929,6 +928,18 @@ def trajectories_mark(
     store.append(marker)
     click.echo(f"Recorded {phase} marker: source={source} label={label} session={marker_session}")
     click.echo(f"  {store.path}")
+    if phase == "end":
+        click.echo("")
+        click.echo("You can inspect and evolve the skill now:")
+        click.echo(
+            f"  protean trajectories inspect --source {source} "
+            f"--label {label} --session {marker_session}"
+        )
+        click.echo(
+            f"  protean trajectories evolve  --source {source} "
+            f"--label {label} --session {marker_session} --task \"<original task>\""
+        )
+        click.echo("  (run `evolve` detached so the chat is not blocked)")
 
 
 @trajectories.command("inspect")
@@ -1085,12 +1096,10 @@ def agents_setup(
     except ValueError as e:
         raise click.ClickException(str(e)) from e
 
-    root = Path(__file__).resolve().parents[1]
     extra_pairs = load_exportable_skill_pairs(config.skills_dir)
 
     result = setup_agent(
         agent_target,
-        protean_root=root,
         extra_skill_pairs=extra_pairs,
     )
     click.echo(f"Target: {result.target.display_name}")
@@ -1098,6 +1107,8 @@ def agents_setup(
     click.echo(f"Agent skill: {result.bootstrap_path}")
     if result.instructions_path is not None:
         click.echo(f"Instructions: {result.instructions_path}")
+    if result.mcp_config_path is not None:
+        click.echo(f"MCP config: {result.mcp_config_path}")
     if result.copied_skills:
         click.echo("Copied Protean skills:")
         for path in result.copied_skills:
@@ -1159,6 +1170,39 @@ def agents_uninstall(
             click.echo(f"  {verb} instructions file: {result.instructions_path}")
         else:
             click.echo("  Instructions: no managed block to remove")
+        if result.mcp_config_path is not None:
+            click.echo(f"  Cleaned MCP config: {result.mcp_config_path}")
+        else:
+            click.echo("  MCP config: no managed entry to remove")
+
+
+@main.command("mcp")
+@click.pass_context
+def mcp(ctx: click.Context) -> None:
+    """Serve Protean's GUI tools as an MCP server over stdio.
+
+    Designed to be wired into external CLI agents (Codex, Claude Code,
+    ...) via their ``mcp_servers`` config. The server exposes Platform
+    methods — screenshot, click, type_text, key_press, scroll,
+    activate_app, get_active_window, get_clipboard — so the agent can
+    drive the GUI through Protean's tool surface instead of shelling out.
+    """
+    import asyncio
+
+    from mcp.server.stdio import stdio_server
+
+    from protean.mcp import build_mcp_server
+    from protean.platform import get_platform
+
+    server_config = build_mcp_server(get_platform())
+    server = server_config["instance"]
+    init_options = server.create_initialization_options()
+
+    async def _run() -> None:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, init_options)
+
+    asyncio.run(_run())
 
 
 @main.group()

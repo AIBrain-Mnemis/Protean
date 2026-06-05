@@ -8,8 +8,11 @@ from protean.agent_setup import (
     AgentTarget,
     copy_skill_dirs,
     inject_instructions,
+    inject_mcp_config,
     install_bootstrap_skill,
     remove_instructions,
+    remove_mcp_config,
+    resolve_agent_target,
     uninstall_agent,
 )
 from protean.cli import main
@@ -21,20 +24,17 @@ from protean.skills.registry import load_skill_from_file
 from protean.skills.schema import Skill
 
 
-def _bootstrap_skill(protean_root: Path | None = None, source: str = "codex") -> Skill:
-    return build_and_evolve_skills_with_protean_skill(
-        source_default=source,
-        protean_root=protean_root,
-    )
+def _bootstrap_skill(source: str = "codex") -> Skill:
+    return build_and_evolve_skills_with_protean_skill(source_default=source)
 
 
-def test_install_bootstrap_skill_adapts_source_and_repo_root(tmp_path: Path):
+def test_install_bootstrap_skill_adapts_source(tmp_path: Path):
     target = AgentTarget(
         display_name="Claude Code",
         source="claude_code",
         skills_dir=tmp_path / "agent-skills",
     )
-    skill = _bootstrap_skill(protean_root=tmp_path / "Protean Repo", source="claude_code")
+    skill = _bootstrap_skill(source="claude_code")
     md_path = install_bootstrap_skill(target, skill)
 
     text = md_path.read_text(encoding="utf-8")
@@ -42,8 +42,6 @@ def test_install_bootstrap_skill_adapts_source_and_repo_root(tmp_path: Path):
     source_param = next(p for p in parsed.parameters if p.name == "source")
 
     assert source_param.default == "claude_code"
-    assert "cd " in text
-    assert "Protean Repo" in text
     assert "--source \"{{source}}\"" in text
     assert "trajectories evolve" in text
 
@@ -345,3 +343,181 @@ def test_agents_uninstall_all_only_targets_installed(tmp_path: Path, monkeypatch
     assert "Codex" in result.output
     assert "Claude Code" not in result.output
     assert not (tmp_path / "codex-home" / "skills" / AGENT_PROTEAN_SKILL_NAME).exists()
+
+
+# ---------- MCP config injection ---------------------------------------------
+
+
+def _codex_target(tmp_path: Path) -> AgentTarget:
+    return AgentTarget(
+        display_name="Codex",
+        source="codex",
+        skills_dir=tmp_path / "skills",
+        instructions_file=tmp_path / "AGENTS.md",
+        mcp_config_file=tmp_path / "config.toml",
+        mcp_config_format="toml",
+    )
+
+
+def _claude_target(tmp_path: Path) -> AgentTarget:
+    return AgentTarget(
+        display_name="Claude Code",
+        source="claude_code",
+        skills_dir=tmp_path / "claude" / "skills",
+        instructions_file=tmp_path / "claude" / "CLAUDE.md",
+        mcp_config_file=tmp_path / "claude.json",
+        mcp_config_format="json",
+    )
+
+
+def test_inject_mcp_config_toml_creates_file(tmp_path: Path):
+    import tomllib
+    target = _codex_target(tmp_path)
+    path = inject_mcp_config(target)
+    assert path == target.mcp_config_file
+    doc = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert doc["mcp_servers"]["protean"] == {
+        "command": "protean",
+        "args": ["mcp"],
+    }
+
+
+def test_inject_mcp_config_toml_replaces_only_protean_entry(tmp_path: Path):
+    import tomllib
+    target = _codex_target(tmp_path)
+    target.mcp_config_file.write_text(
+        'model = "gpt-5"\n'
+        '\n'
+        '[mcp_servers.protean]\n'
+        'command = "stale"\n'
+        '\n'
+        '[other.section]\n'
+        'key = 1\n',
+        encoding="utf-8",
+    )
+
+    inject_mcp_config(target)
+
+    text = target.mcp_config_file.read_text(encoding="utf-8")
+    doc = tomllib.loads(text)
+    assert doc["mcp_servers"]["protean"]["command"] == "protean"
+    assert doc["model"] == "gpt-5"  # user content preserved
+    assert doc["other"]["section"]["key"] == 1  # sibling table preserved
+
+
+def test_inject_mcp_config_toml_preserves_sibling_mcp_servers(tmp_path: Path):
+    """Regression test: a sibling [mcp_servers.<name>] table must survive.
+
+    The previous sentinel-based implementation wrapped a literal text block
+    and could absorb any later-added section into its range; codex adds
+    [mcp_servers.node_repl] on startup, which was being deleted by uninstall.
+    """
+    import tomllib
+    target = _codex_target(tmp_path)
+    target.mcp_config_file.write_text(
+        '[mcp_servers.node_repl]\n'
+        'command = "/Applications/Codex.app/Contents/Resources/node_repl"\n'
+        'args = []\n'
+        '\n'
+        '[mcp_servers.node_repl.env]\n'
+        'NODE_REPL_FOO = "bar"\n',
+        encoding="utf-8",
+    )
+
+    inject_mcp_config(target)
+
+    doc = tomllib.loads(target.mcp_config_file.read_text(encoding="utf-8"))
+    assert doc["mcp_servers"]["protean"]["command"] == "protean"
+    assert doc["mcp_servers"]["node_repl"]["command"].endswith("node_repl")
+    assert doc["mcp_servers"]["node_repl"]["env"]["NODE_REPL_FOO"] == "bar"
+
+
+def test_inject_mcp_config_toml_is_idempotent(tmp_path: Path):
+    target = _codex_target(tmp_path)
+    inject_mcp_config(target)
+    first = target.mcp_config_file.read_text(encoding="utf-8")
+    inject_mcp_config(target)
+    assert target.mcp_config_file.read_text(encoding="utf-8") == first
+
+
+def test_inject_mcp_config_json_creates_file(tmp_path: Path):
+    target = _claude_target(tmp_path)
+    path = inject_mcp_config(target)
+    assert path == target.mcp_config_file
+    import json
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["mcpServers"]["protean"] == {
+        "type": "stdio",
+        "command": "protean",
+        "args": ["mcp"],
+        "env": {},
+    }
+
+
+def test_inject_mcp_config_json_preserves_other_keys(tmp_path: Path):
+    import json
+    target = _claude_target(tmp_path)
+    target.mcp_config_file.write_text(
+        json.dumps({"numStartups": 7, "mcpServers": {"other": {"command": "x"}}}),
+        encoding="utf-8",
+    )
+
+    inject_mcp_config(target)
+
+    data = json.loads(target.mcp_config_file.read_text(encoding="utf-8"))
+    assert data["numStartups"] == 7
+    assert data["mcpServers"]["other"] == {"command": "x"}
+    assert data["mcpServers"]["protean"]["command"] == "protean"
+
+
+def test_remove_mcp_config_toml_preserves_surrounding_content(tmp_path: Path):
+    import tomllib
+    target = _codex_target(tmp_path)
+    target.mcp_config_file.write_text(
+        '[mcp_servers.node_repl]\n'
+        'command = "/Applications/Codex.app/Contents/Resources/node_repl"\n'
+        '\n'
+        '[other.section]\n'
+        'k = 1\n',
+        encoding="utf-8",
+    )
+    inject_mcp_config(target)
+
+    path = remove_mcp_config(target)
+    assert path == target.mcp_config_file
+
+    doc = tomllib.loads(target.mcp_config_file.read_text(encoding="utf-8"))
+    assert "protean" not in doc.get("mcp_servers", {})
+    assert doc["mcp_servers"]["node_repl"]["command"].endswith("node_repl")
+    assert doc["other"]["section"]["k"] == 1
+
+
+def test_remove_mcp_config_json_drops_only_protean_entry(tmp_path: Path):
+    import json
+    target = _claude_target(tmp_path)
+    target.mcp_config_file.write_text(
+        json.dumps({"numStartups": 7, "mcpServers": {"other": {"command": "x"}}}),
+        encoding="utf-8",
+    )
+    inject_mcp_config(target)
+
+    remove_mcp_config(target)
+
+    data = json.loads(target.mcp_config_file.read_text(encoding="utf-8"))
+    assert data["numStartups"] == 7
+    assert data["mcpServers"] == {"other": {"command": "x"}}
+
+
+def test_remove_mcp_config_is_noop_when_no_entry(tmp_path: Path):
+    target = _codex_target(tmp_path)
+    target.mcp_config_file.write_text("model = \"gpt-5\"\n", encoding="utf-8")
+
+    assert remove_mcp_config(target) is None
+    assert target.mcp_config_file.read_text(encoding="utf-8") == "model = \"gpt-5\"\n"
+
+
+def test_claude_target_mcp_path_follows_claude_home(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "custom-claude"))
+    target = resolve_agent_target("claude_code")
+    assert target.mcp_config_file == tmp_path / "custom-claude.json"
+

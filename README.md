@@ -68,11 +68,10 @@ Today Protean ships the desktop-automation slice of that vision end-to-end:
 - **Multi-provider LLM**: OpenAI, Anthropic, Gemini, and Doubao (Ark) for
   offline skill generation.
 - **Cross-platform tool suite**: `screenshot`, `click`, `click_at`,
-  `type_text`, `key_press`, `find_elements`, `activate_app`, `menu_click`,
-  `select_option`, `list_elements`, `list_menu` — driven directly by
-  `computer_use` (default), or exposed to external CLI agents
-  (`claude_code` via `-E claude_code`) through the in-process MCP surface
-  in `protean/executor/mcp.py`.
+  `type_text`, `key_press`, `activate_app`, `select_option` — driven
+  directly by `computer_use` (default), or exposed to external CLI
+  agents (`claude_code` via `-E claude_code`) through the in-process
+  MCP surface in `protean/mcp/server.py`.
 - **Step idempotency**: each step carries an `idempotent` flag; the validator
   retries idempotent failures and escalates the rest.
 - **Capture-proof overlay** (`--overlay`): floating log window invisible to
@@ -335,7 +334,7 @@ Protean ships two executor backends; pick with `-E` on `daemon` and
   Needs the Claude Code CLI on `PATH` and an `ANTHROPIC_API_KEY`. The
   SDK manages the CLI subprocess; Protean's Platform tools are exposed
   to it through the in-process MCP surface in
-  `protean/executor/mcp.py`. Same tool surface, different driver loop.
+  `protean/mcp/server.py`. Same tool surface, different driver loop.
 
 ### Bridge env vars (channel 2)
 
@@ -406,7 +405,7 @@ Layer roles:
   internal agent that calls Platform directly) and `claude_code` (Claude
   Code CLI via `claude-agent-sdk`, an external CLI agent). External CLI
   executors plug into Platform through the in-process MCP surface in
-  `protean/executor/mcp.py`.
+  `protean/mcp/server.py`.
 - **`protean/channels/`** — `AssistantChannel` protocol + the Electron-bridge
   IPC client (TypeScript schema is mirrored 1:1 in
   [`electron-bridge/src/protocol.ts`](electron-bridge/src/protocol.ts) and

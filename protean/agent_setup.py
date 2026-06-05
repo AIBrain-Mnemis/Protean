@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import tomlkit
 
 from protean.skills.bootstrap import (
     AGENT_PROTEAN_SKILL_NAME,
@@ -21,6 +24,15 @@ if TYPE_CHECKING:
     from protean.skills.schema import Skill
 
 
+# MCP server name. The single source of truth for the wire-format tool
+# prefix (``mcp__protean__*``), the in-process key in
+# ``ClaudeAgentOptions.mcp_servers``, and the user-facing config key in
+# the external CLI agent's MCP config (codex ``mcp_servers.protean`` /
+# claude_code ``mcpServers.protean``). Must match
+# ``create_sdk_mcp_server(name=...)`` in ``protean/mcp/server.py``.
+_MCP_SERVER_NAME = "protean"
+
+
 @dataclass(frozen=True)
 class AgentTarget:
     display_name: str
@@ -30,6 +42,11 @@ class AgentTarget:
     # (Codex: AGENTS.md, Claude Code: CLAUDE.md). None = runtime has no such
     # convention, so instruction injection is skipped.
     instructions_file: Path | None = None
+    # User-level MCP server config the runtime reads on startup.
+    # Codex: ~/.codex/config.toml (TOML), Claude Code: ~/.claude.json (JSON).
+    # None = runtime has no such convention.
+    mcp_config_file: Path | None = None
+    mcp_config_format: str | None = None  # "toml" | "json"
 
 
 @dataclass(frozen=True)
@@ -38,6 +55,7 @@ class AgentSetupResult:
     bootstrap_path: Path
     copied_skills: list[Path]
     instructions_path: Path | None
+    mcp_config_path: Path | None
 
 
 @dataclass(frozen=True)
@@ -52,6 +70,8 @@ class AgentUninstallResult:
     # nothing but the managed block was left in it.
     instructions_path: Path | None
     instructions_file_deleted: bool
+    # MCP config file we touched (None if no file or no managed entry).
+    mcp_config_path: Path | None
 
 
 def resolve_agent_target(kind: str) -> AgentTarget:
@@ -63,14 +83,23 @@ def resolve_agent_target(kind: str) -> AgentTarget:
             source="codex",
             skills_dir=home / "skills",
             instructions_file=home / "AGENTS.md",
+            mcp_config_file=home / "config.toml",
+            mcp_config_format="toml",
         )
     if normalized in {"claude", "claude_code"}:
         home = Path(os.getenv("CLAUDE_HOME", str(Path.home() / ".claude"))).expanduser()
+        # Claude Code stores its MCP config in a sibling JSON file
+        # (``~/.claude.json`` for the default home). Deriving by sibling
+        # name lets a custom CLAUDE_HOME stay self-contained instead of
+        # always pointing back at the real ``~/.claude.json``.
+        mcp_path = home.parent / f"{home.name}.json"
         return AgentTarget(
             display_name="Claude Code",
             source="claude_code",
             skills_dir=home / "skills",
             instructions_file=home / "CLAUDE.md",
+            mcp_config_file=mcp_path,
+            mcp_config_format="json",
         )
     raise ValueError(f"Unsupported agent target: {kind}")
 
@@ -80,6 +109,74 @@ def install_bootstrap_skill(
     skill: "Skill",
 ) -> Path:
     return render_skill(skill, target.skills_dir / skill.name)
+
+
+def upsert_sentinel_block(
+    path: Path,
+    *,
+    begin: str,
+    end: str,
+    block: str,
+) -> None:
+    """Write ``block`` (which must include ``begin`` and ``end``) into ``path``.
+
+    Behavior:
+    - If the file contains ``begin`` and ``end`` (with begin first), replace
+      everything between (and including) them with ``block``. A single
+      newline immediately after the old ``end`` is swallowed so re-runs
+      don't accumulate blank lines.
+    - If the file exists but has no sentinels, append ``block`` separated
+      by a blank line.
+    - If the file is missing or empty, write ``block`` as the whole file.
+    - The resulting file always ends with a single trailing newline.
+    - No write happens if the content would be unchanged.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+
+    begin_idx = existing.find(begin)
+    end_idx = existing.find(end)
+    if begin_idx != -1 and end_idx != -1 and end_idx > begin_idx:
+        end_idx += len(end)
+        if end_idx < len(existing) and existing[end_idx] == "\n":
+            end_idx += 1
+        updated = existing[:begin_idx] + block + existing[end_idx:]
+    elif existing.strip():
+        updated = f"{existing.rstrip()}\n\n{block}"
+    else:
+        updated = block
+
+    if not updated.endswith("\n"):
+        updated += "\n"
+
+    if updated != existing:
+        path.write_text(updated, encoding="utf-8")
+
+
+def remove_sentinel_block(path: Path, *, begin: str, end: str) -> bool:
+    """Remove the block delimited by ``begin``/``end`` from ``path``.
+
+    Returns True if a block was found and removed, False otherwise.
+    The file is left empty (not deleted) when nothing remains after
+    removal; callers can decide whether to unlink.
+    """
+    existing = path.read_text(encoding="utf-8")
+    begin_idx = existing.find(begin)
+    end_idx = existing.find(end)
+    if begin_idx == -1 or end_idx == -1 or end_idx <= begin_idx:
+        return False
+
+    end_idx += len(end)
+    if end_idx < len(existing) and existing[end_idx] == "\n":
+        end_idx += 1
+    updated = (existing[:begin_idx].rstrip() + "\n" + existing[end_idx:]).lstrip("\n")
+    if updated.strip():
+        if not updated.endswith("\n"):
+            updated += "\n"
+        path.write_text(updated, encoding="utf-8")
+    else:
+        path.write_text("", encoding="utf-8")
+    return True
 
 
 # Sentinel markers delimit the Protean-managed region in the agent's
@@ -99,17 +196,16 @@ In practice, Protean covers:
 - hand-editing or importing a SKILL.md
 - replaying a skill with self-refinement
 - evolving the current agent session's trajectory into a reusable skill
+
+Invoking the Protean CLI: prefer the bare `protean` command. If the shell reports "command not found", retry with the canonical shim path written by Protean's installer:
+- POSIX (macOS / Linux): `~/.local/bin/protean`
+- Windows (PowerShell / cmd): `%USERPROFILE%\\.local\\bin\\protean.cmd`
+This applies to every `protean ...` invocation (`skills`, `record`, `generate`, `daemon`, `trajectories`, etc.).
 """
 
 
 def inject_instructions(target: AgentTarget, skill: "Skill") -> Path | None:
     """Insert or refresh the Protean block in the agent's instruction file.
-
-    Strategy:
-
-    - If the file already contains the sentinel markers, replace everything
-      between them (the user keeps their surrounding content).
-    - Otherwise append a new block to the end (or create the file).
 
     Returns the path written, or ``None`` when the target has no
     instructions-file convention.
@@ -119,24 +215,114 @@ def inject_instructions(target: AgentTarget, skill: "Skill") -> Path | None:
         return None
 
     body = _INSTRUCTIONS_BLOCK_TEMPLATE.format(skill_name=skill.name)
-    block = f"{_INSTRUCTIONS_BLOCK_BEGIN}\n{body}\n{_INSTRUCTIONS_BLOCK_END}"
+    block = f"{_INSTRUCTIONS_BLOCK_BEGIN}\n{body}\n{_INSTRUCTIONS_BLOCK_END}\n"
+    upsert_sentinel_block(
+        path,
+        begin=_INSTRUCTIONS_BLOCK_BEGIN,
+        end=_INSTRUCTIONS_BLOCK_END,
+        block=block,
+    )
+    return path
+
+
+# Sentinel comments wrap the Protean MCP entry in TOML configs. JSON
+# configs use a single object key (``mcpServers.protean``) so no
+# sentinel is needed there.
+# (TOML uses tomlkit for structured edits and does not need sentinels.)
+
+
+def _mcp_toml_table() -> "tomlkit.items.Table":
+    table = tomlkit.table()
+    table["command"] = "protean"
+    table["args"] = ["mcp"]
+    return table
+
+
+def inject_mcp_config(target: AgentTarget) -> Path | None:
+    """Register Protean as an MCP server in the runtime's user config.
+
+    Codex (TOML): set ``mcp_servers.protean`` via tomlkit so the user's
+    other tables, comments, and formatting are preserved verbatim.
+
+    Claude Code (JSON): parse, set ``mcpServers.protean``, write back.
+    Other keys are preserved verbatim.
+
+    Returns the config path written, or ``None`` when the target has no
+    MCP config convention.
+    """
+    path = target.mcp_config_file
+    fmt = target.mcp_config_format
+    if path is None or fmt is None:
+        return None
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
 
-    begin_idx = existing.find(_INSTRUCTIONS_BLOCK_BEGIN)
-    end_idx = existing.find(_INSTRUCTIONS_BLOCK_END)
-    if begin_idx != -1 and end_idx != -1 and end_idx > begin_idx:
-        end_idx += len(_INSTRUCTIONS_BLOCK_END)
-        updated = existing[:begin_idx] + block + existing[end_idx:]
-    elif existing.strip():
-        updated = f"{existing.rstrip()}\n\n{block}\n"
-    else:
-        updated = f"{block}\n"
+    if fmt == "toml":
+        if path.exists():
+            doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+        else:
+            doc = tomlkit.document()
+        servers = doc.get("mcp_servers")
+        if not isinstance(servers, dict):
+            servers = tomlkit.table()
+            doc["mcp_servers"] = servers
+        servers[_MCP_SERVER_NAME] = _mcp_toml_table()
+        path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+        return path
 
-    if updated != existing:
-        path.write_text(updated, encoding="utf-8")
-    return path
+    if fmt == "json":
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            data = {}
+        servers = data.setdefault("mcpServers", {})
+        servers[_MCP_SERVER_NAME] = {
+            "type": "stdio",
+            "command": "protean",
+            "args": ["mcp"],
+            "env": {},
+        }
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    raise ValueError(f"Unsupported MCP config format: {fmt}")
+
+
+def remove_mcp_config(target: AgentTarget) -> Path | None:
+    """Remove the Protean MCP entry from the runtime's user config.
+
+    Returns the path touched, or ``None`` when there was nothing to do.
+    """
+    path = target.mcp_config_file
+    fmt = target.mcp_config_format
+    if path is None or fmt is None or not path.exists():
+        return None
+
+    if fmt == "toml":
+        doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+        servers = doc.get("mcp_servers")
+        if not isinstance(servers, dict) or _MCP_SERVER_NAME not in servers:
+            return None
+        del servers[_MCP_SERVER_NAME]
+        # Drop the parent table if Protean was the only entry; otherwise
+        # leave the user's other mcp_servers alone.
+        if len(servers) == 0:
+            del doc["mcp_servers"]
+        path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+        return path
+
+    if fmt == "json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        servers = data.get("mcpServers")
+        if not isinstance(servers, dict) or _MCP_SERVER_NAME not in servers:
+            return None
+        del servers[_MCP_SERVER_NAME]
+        if not servers:
+            del data["mcpServers"]
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    raise ValueError(f"Unsupported MCP config format: {fmt}")
 
 
 def copy_skill_dirs(
@@ -170,13 +356,11 @@ def load_exportable_skill_pairs(skills_dir: Path) -> list[tuple["Skill", Path | 
 def setup_agent(
     target: AgentTarget,
     *,
-    protean_root: Path,
     extra_skill_pairs: "Iterable[tuple[Skill, Path | None]]" = (),
 ) -> AgentSetupResult:
     target.skills_dir.mkdir(parents=True, exist_ok=True)
     bootstrap_skill = build_and_evolve_skills_with_protean_skill(
         source_default=target.source,
-        protean_root=protean_root,
     )
     bootstrap_path = install_bootstrap_skill(target, bootstrap_skill)
     copied_skills = copy_skill_dirs(
@@ -184,11 +368,13 @@ def setup_agent(
         target.skills_dir,
     )
     instructions_path = inject_instructions(target, bootstrap_skill)
+    mcp_config_path = inject_mcp_config(target)
     return AgentSetupResult(
         target=target,
         bootstrap_path=bootstrap_path,
         copied_skills=copied_skills,
         instructions_path=instructions_path,
+        mcp_config_path=mcp_config_path,
     )
 
 
@@ -204,21 +390,16 @@ def remove_instructions(target: AgentTarget) -> tuple[Path | None, bool]:
     if path is None or not path.exists():
         return None, False
 
-    existing = path.read_text(encoding="utf-8")
-    begin_idx = existing.find(_INSTRUCTIONS_BLOCK_BEGIN)
-    end_idx = existing.find(_INSTRUCTIONS_BLOCK_END)
-    if begin_idx == -1 or end_idx == -1 or end_idx <= begin_idx:
+    if not remove_sentinel_block(
+        path,
+        begin=_INSTRUCTIONS_BLOCK_BEGIN,
+        end=_INSTRUCTIONS_BLOCK_END,
+    ):
         return None, False
 
-    end_idx += len(_INSTRUCTIONS_BLOCK_END)
-    updated = (existing[:begin_idx] + existing[end_idx:]).strip()
-
-    if not updated:
+    if path.read_text(encoding="utf-8") == "":
         path.unlink()
         return path, True
-
-    # Preserve a trailing newline so the file remains POSIX-clean.
-    path.write_text(updated + "\n", encoding="utf-8")
     return path, False
 
 
@@ -251,6 +432,7 @@ def uninstall_agent(
             removed_skills.append(skill_dir)
 
     instructions_path, file_deleted = remove_instructions(target)
+    mcp_config_path = remove_mcp_config(target)
 
     return AgentUninstallResult(
         target=target,
@@ -258,6 +440,7 @@ def uninstall_agent(
         removed_skills=removed_skills,
         instructions_path=instructions_path,
         instructions_file_deleted=file_deleted,
+        mcp_config_path=mcp_config_path,
     )
 
 
@@ -296,8 +479,6 @@ def installed_agent_targets() -> list[AgentTarget]:
 
 def sync_installed_agents(
     skills_dir: Path,
-    *,
-    protean_root: Path,
 ) -> list[AgentSetupResult]:
     """Re-run ``setup_agent`` for every installed runtime.
 
@@ -313,7 +494,6 @@ def sync_installed_agents(
     return [
         setup_agent(
             target,
-            protean_root=protean_root,
             extra_skill_pairs=extra_pairs,
         )
         for target in targets

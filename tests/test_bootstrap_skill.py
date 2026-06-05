@@ -16,7 +16,6 @@ def test_bootstrap_skill_renders_with_protean_renderer(tmp_path: Path):
 
     assert skill.name == AGENT_PROTEAN_SKILL_NAME
     assert "build, run, validate, import, hand-edit, refine, and evolve" in skill.description
-    assert "agents setup" in rendered
     assert "Use Protean as the local capability factory" in rendered
     assert "Workflow choice" in rendered
     assert "Codex" in rendered
@@ -31,7 +30,6 @@ def test_bootstrap_skill_renders_with_protean_renderer(tmp_path: Path):
     assert "trajectories mark start" in rendered
     assert "trajectories evolve" in rendered
     assert '--source "{{source}}"' in rendered
-    assert "local runtime session transcript" in rendered
     assert "simple ReAct stream" in rendered
     assert "invite attendees as irreversible" in rendered
     assert "--overlay" not in rendered

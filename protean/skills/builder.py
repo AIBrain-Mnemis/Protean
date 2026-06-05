@@ -425,6 +425,7 @@ class SkillBuilder:
         llm: LLM,
         *,
         existing_skill: Skill | None = None,
+        required_name: str = "",
         prompt: str,
         model: str | None = None,
         temperature: float = 1.0,
@@ -568,6 +569,26 @@ class SkillBuilder:
                     )})
                     continue
 
+            if existing_skill is None and required_name:
+                expected_name = to_kebab(required_name)
+                generated_name = to_kebab(output.name)
+                if generated_name != expected_name:
+                    log.warning(
+                        "_generate_from_trajectory: generated skill name %r "
+                        "does not match required name %r (attempt %d/%d); retrying",
+                        output.name, expected_name, attempt + 1, max_attempts,
+                    )
+                    messages.append({"role": "assistant", "content": output.model_dump_json()})
+                    messages.append({"role": "user", "content": (
+                        f"Generated skill name {output.name!r} did not match "
+                        f"the required target name {expected_name!r}. Regenerate "
+                        "the same intended skill with exactly that name, and keep "
+                        "the description, when_to_use, inputs, steps, and success "
+                        "criteria aligned with that target."
+                    )})
+                    continue
+                output.name = expected_name
+
             errors = output.validate_steps()
             script_errors = output.validate_scripts()
             if not errors and not script_errors:
@@ -659,7 +680,7 @@ class SkillBuilder:
         *,
         model: str | None = None,
         temperature: float = 1.0,
-        router_analysis: str = "",
+        evolution_guidance: str = "",
     ) -> Skill:
         """Refine a skill using its full execution trajectory.
 
@@ -672,13 +693,14 @@ class SkillBuilder:
         prompt = REFINE_PROMPT.replace(
             "{skill_steps}", render_skill_markdown(skill),
         )
-        if router_analysis:
+        if evolution_guidance:
             prompt += (
-                "\n\n## Router analysis\n"
-                "The evolution router reviewed this trajectory and decided "
-                "to refine this skill for the following reason. Use it as "
-                "guidance for what to improve.\n\n"
-                f"{router_analysis}\n"
+                "\n\n## Evolution guidance\n"
+                "The evolution router selected this existing skill for a "
+                "focused update. Apply this learning contract as the delta to "
+                "the current skill; do not absorb unrelated trajectory details "
+                "outside the stated intent and evidence.\n\n"
+                f"{evolution_guidance}\n"
             )
         return await self._generate_from_trajectory(
             trajectory,
@@ -695,9 +717,10 @@ class SkillBuilder:
         llm: LLM,
         *,
         task_context: str = "",
+        target_name: str = "",
         model: str | None = None,
         temperature: float = 1.0,
-        router_analysis: str = "",
+        evolution_guidance: str = "",
     ) -> Skill:
         """Create a new skill from an execution trajectory.
 
@@ -706,18 +729,23 @@ class SkillBuilder:
         prompt = CREATE_FROM_TRAJECTORY_PROMPT.replace(
             "{task_context}", task_context or "(no task context)",
         )
-        if router_analysis:
+        if target_name or evolution_guidance:
             prompt += (
-                "\n\n## Router analysis\n"
-                "The evolution router reviewed this trajectory and decided "
-                "to create a new skill for the following reason. Use it as "
-                "guidance for what to capture.\n\n"
-                f"{router_analysis}\n"
+                "\n\n## Evolution target\n"
+                "Create exactly one skill for this target. The full trajectory "
+                "is available as evidence, but the skill must stay aligned with "
+                "the target name and focused intent, not necessarily with every "
+                "detail of the surface task.\n"
             )
+            if target_name:
+                prompt += f"\nRequired skill name: `{to_kebab(target_name)}`\n"
+            if evolution_guidance:
+                prompt += f"\n{evolution_guidance}\n"
         return await self._generate_from_trajectory(
             trajectory,
             llm,
             existing_skill=None,
+            required_name=target_name,
             prompt=prompt,
             model=model,
             temperature=temperature,
@@ -762,7 +790,10 @@ class SkillBuilder:
                     task_description, include_images,
                 )
                 messages: list[dict] = [
-                    {"role": "system", "content": RECORDING_SYSTEM_PROMPT + "\n" + get_toolkit_prompt()},
+                    {
+                        "role": "system",
+                        "content": RECORDING_SYSTEM_PROMPT + "\n" + get_toolkit_prompt(),
+                    },
                     {"role": "user", "content": content_parts},
                 ]
                 try:

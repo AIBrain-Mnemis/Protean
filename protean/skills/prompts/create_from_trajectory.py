@@ -11,6 +11,14 @@ this into a clean, reusable skill that a future agent can follow to solve simila
 tasks faster and more reliably. Skip dead-end retries but capture what finally
 worked and why earlier attempts failed.
 
+The trajectory is ONE concrete execution. The skill must generalize. Do NOT bake
+concrete instances from this run — specific people, rooms, file paths, dates,
+organization names, project ids — into the skill's ``description``, ``goal``,
+``when_to_use``, step actions, or ``success_criteria``. Express those slots as
+parameters or as schematic placeholders. The resulting skill should read as if
+it could run on any equivalent input next week, not as a log of what happened
+today.
+
 """ + STEP_FIELD_RULES + """
 ## Task context
 

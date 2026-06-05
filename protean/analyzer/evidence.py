@@ -19,6 +19,7 @@ from pathlib import Path
 
 from protean.analyzer.compaction import CompactedEvent, compact_events
 from protean.analyzer.frames import FramePair, extract_frame_pair
+from protean.recorder.audio import transcribe
 
 DEFAULT_MAX_CONTEXT = 200_000        # tokens — Anthropic Sonnet/Opus default
 RESPONSE_TOKEN_RESERVE = 16_000       # leave room for the structured Skill output
@@ -180,37 +181,6 @@ def _collect_utterances(raw_events: list[dict]) -> list[dict]:
         end = start + (float(dur) if isinstance(dur, (int, float)) else 0.0)
         items.append({"start": start, "end": end, "text": text})
     return items
-
-
-def _transcribe_audio(audio_path: Path) -> str:
-    """Transcribe audio using local whisper CLI. Returns transcript text."""
-    import subprocess
-
-    try:
-        subprocess.run(
-            [
-                "whisper",
-                str(audio_path),
-                "--model",
-                "base",
-                "--output_format",
-                "txt",
-                "--output_dir",
-                str(audio_path.parent),
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=300,
-        )
-        txt_path = audio_path.with_suffix(".txt")
-        if txt_path.exists():
-            return txt_path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        pass  # whisper not installed
-    except Exception:
-        pass
-    return ""
 
 
 @dataclass
@@ -628,7 +598,6 @@ def build_evidence_pack(recording_dir: Path) -> EvidencePack:
     raw = json.loads(events_file.read_text(encoding="utf-8"))
     all_events: list[dict] = raw.get("events", [])
     duration = raw.get("duration", 0)
-    version = raw.get("version", "0.1.0")
 
     # Step 1: Compact events
     compacted = compact_events(all_events)
@@ -683,7 +652,8 @@ def build_evidence_pack(recording_dir: Path) -> EvidencePack:
 
     # Mode A: salient events
     salient = [
-        e for e in compacted if e.event_type in ("click", "hotkey", "type", "drag", "app_switch", "key")
+        e for e in compacted
+        if e.event_type in ("click", "hotkey", "type", "drag", "app_switch", "key")
     ]
 
     # Mode B: scene changes
@@ -693,7 +663,11 @@ def build_evidence_pack(recording_dir: Path) -> EvidencePack:
     timeline: list[tuple[float, str, CompactedEvent | None]] = []
 
     for event in salient:
-        ts = event.end_timestamp if event.event_type == "drag" and event.end_timestamp else event.timestamp
+        ts = (
+            event.end_timestamp
+            if event.event_type == "drag" and event.end_timestamp
+            else event.timestamp
+        )
         video_ts = max(0.0, ts - time_offset)
         timeline.append((video_ts, "event", event))
 
@@ -761,7 +735,7 @@ def build_evidence_pack(recording_dir: Path) -> EvidencePack:
     if not utterances:
         audio_path = work_dir / "audio.m4a"
         if _extract_audio(video_path, audio_path):
-            text = _transcribe_audio(audio_path)
+            text = transcribe(audio_path)
             if text:
                 utterances = [{"start": 0.0, "end": duration, "text": text}]
 

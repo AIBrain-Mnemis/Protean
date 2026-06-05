@@ -6,10 +6,10 @@ listener (pynput). No GUI window is needed — pynput observes events at
 the HID layer globally.
 
 Run:
-    uv run python tests/test_input_events.py
-    uv run python tests/test_input_events.py --only keys
-    uv run python tests/test_input_events.py --only mouse
-    uv run python tests/test_input_events.py --only text
+    uv run python tests/smoke_input_events.py
+    uv run python tests/smoke_input_events.py --only keys
+    uv run python tests/smoke_input_events.py --only mouse
+    uv run python tests/smoke_input_events.py --only text
 
 Requires:
     - focused desktop session (don't run over SSH)

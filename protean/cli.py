@@ -73,6 +73,21 @@ def _build_executor(
     )
 
 
+def _sync_installed_agents(config: ProteanConfig) -> list[str]:
+    """Re-propagate `config.skills_dir` to every installed agent runtime.
+
+    Called after any pipeline that writes a skill (record/daemon-hotkey,
+    generate, trajectories evolve, skills run --refine) so Codex / Claude
+    Code see the new or updated skill without the user re-running
+    ``protean agents setup``. Returns the list of target display names
+    that were synced; empty list means no runtime was set up.
+    """
+    from protean.agent_setup import sync_installed_agents
+
+    results = sync_installed_agents(config.skills_dir)
+    return [r.target.display_name for r in results]
+
+
 def _make_overlay_event_writer() -> "Callable[[ExecutorEvent], None]":
     """Build an overlay writer that mirrors `skills run --overlay` output.
 
@@ -392,6 +407,10 @@ def daemon(
                     f"Skill '{skill.name}' generated!\n{md_path}",
                 )
 
+                synced = _sync_installed_agents(config)
+                if synced:
+                    click.echo(f"Synced to: {', '.join(synced)}")
+
                 # Auto-validate the generated skill
                 try:
                     from protean.skills.runner import RunMode, StepRunner
@@ -479,7 +498,7 @@ def daemon(
     click.echo(f"  Bridge: pid={bootstrap.pid} port={bootstrap.port}")
     if supervisor.stderr_log_path is not None:
         click.echo(f"  Bridge log: {supervisor.stderr_log_path}")
-        click.echo(f"    (tail -f to watch heartbeats / errors live)")
+        click.echo("    (tail -f to watch heartbeats / errors live)")
     click.echo("Ctrl+C to quit.")
     platform.notify(
         "Protean",
@@ -798,6 +817,10 @@ def generate(
         click.echo(f"\n--- {md_path.name} ---\n")
         click.echo(md_path.read_text(encoding="utf-8"))
 
+        synced = _sync_installed_agents(config)
+        if synced:
+            click.echo(f"\nSynced to: {', '.join(synced)}")
+
         # ── Optional validation ────────────────────────────
         if validate:
             click.echo("\n--- Validating generated skill ---\n")
@@ -834,6 +857,350 @@ def generate(
                 click.echo(f"Validation failed: {e}", err=True)
             finally:
                 await executor.close()
+
+    asyncio.run(_run())
+
+
+@main.group()
+def trajectories() -> None:
+    """Inspect and evolve agent runtime trajectories."""
+    pass
+
+
+def _marker_store(config: ProteanConfig):
+    from protean.trajectories.markers import TrajectoryMarkerStore
+
+    return TrajectoryMarkerStore(config.data_dir / "trajectory_markers.jsonl")
+
+
+def _resolve_cli_trajectory_slice(config: ProteanConfig, **kwargs):
+    from protean.trajectories.resolver import resolve_trajectory_slice
+
+    try:
+        return resolve_trajectory_slice(
+            marker_store_path=_marker_store(config).path,
+            **kwargs,
+        )
+    except (FileNotFoundError, LookupError, ValueError) as e:
+        raise click.ClickException(str(e)) from e
+
+
+@trajectories.command("mark")
+@click.argument("phase", type=click.Choice(["start", "end"]))
+@click.option(
+    "--source",
+    type=click.Choice(["codex", "claude_code"]),
+    default="codex",
+    show_default=True,
+)
+@click.option("--label", required=True, help="Short episode label")
+@click.option("--task", default="", help="Task text for start markers")
+@click.option("--session", default="current", show_default=True)
+@click.pass_context
+def trajectories_mark(
+    ctx: click.Context,
+    phase: str,
+    source: str,
+    label: str,
+    task: str,
+    session: str,
+) -> None:
+    """Record an explicit trajectory episode marker."""
+    config: ProteanConfig = ctx.obj["config"]
+    from protean.trajectories.markers import TrajectoryMarker, utc_now_iso
+    from protean.trajectories.resolver import trajectory_adapter_cls
+
+    try:
+        marker_session = str(trajectory_adapter_cls(source).resolve_session(session))
+    except FileNotFoundError as e:
+        raise click.ClickException(str(e)) from e
+
+    marker = TrajectoryMarker(
+        source=source,
+        label=label,
+        phase=phase,
+        timestamp=utc_now_iso(),
+        cwd=str(Path.cwd()),
+        task=task,
+        session=marker_session,
+    )
+    store = _marker_store(config)
+    store.append(marker)
+    click.echo(f"Recorded {phase} marker: source={source} label={label} session={marker_session}")
+    click.echo(f"  {store.path}")
+    if phase == "end":
+        click.echo("")
+        click.echo("You can inspect and evolve the skill now:")
+        click.echo(
+            f"  protean trajectories inspect --source {source} "
+            f"--label {label} --session {marker_session}"
+        )
+        click.echo(
+            f"  protean trajectories evolve  --source {source} "
+            f"--label {label} --session {marker_session} --task \"<original task>\""
+        )
+        click.echo("  (run `evolve` detached so the chat is not blocked)")
+
+
+@trajectories.command("inspect")
+@click.option(
+    "--source",
+    type=click.Choice(["codex", "claude_code"]),
+    default="codex",
+    show_default=True,
+)
+@click.option("--session", default="current", show_default=True)
+@click.option("--label", default="", help="Use latest matching marker pair")
+@click.option("--from-message", default="", help="Begin at first message containing text")
+@click.option("--to-message", default="", help="End at first later message containing text")
+@click.option("--from-time", default="", help="Begin timestamp")
+@click.option("--to-time", default="", help="End timestamp")
+@click.pass_context
+def trajectories_inspect(
+    ctx: click.Context,
+    source: str,
+    session: str,
+    label: str,
+    from_message: str,
+    to_message: str,
+    from_time: str,
+    to_time: str,
+) -> None:
+    """Summarize the selected current-session trajectory slice."""
+    config: ProteanConfig = ctx.obj["config"]
+    slice_ = _resolve_cli_trajectory_slice(
+        config,
+        source=source,
+        session=session,
+        label=label,
+        from_message=from_message,
+        to_message=to_message,
+        from_time=from_time,
+        to_time=to_time,
+    )
+    click.echo(f"Session: {slice_.session_path}")
+    click.echo(f"Range:   {slice_.start_time.isoformat()} -> {slice_.end_time.isoformat()}")
+    click.echo(
+        f"Events:  raw={len(slice_.events)} "
+        f"react={len(slice_.react_events)} tools={slice_.tool_count}"
+    )
+    used = slice_.used_skills
+    click.echo(f"Skills used: {', '.join(used) if used else '(none detected)'}")
+    click.echo("User messages:")
+    for i, msg in enumerate(slice_.user_messages[:8], 1):
+        click.echo(f"  {i}. {msg[:240]}")
+    if len(slice_.user_messages) > 8:
+        click.echo(f"  ... {len(slice_.user_messages) - 8} more")
+
+
+@trajectories.command("evolve")
+@click.option(
+    "--source",
+    type=click.Choice(["codex", "claude_code"]),
+    default="codex",
+    show_default=True,
+)
+@click.option("--session", default="current", show_default=True)
+@click.option("--label", default="", help="Use latest matching marker pair")
+@click.option("--from-message", default="", help="Begin at first message containing text")
+@click.option("--to-message", default="", help="End at first later message containing text")
+@click.option("--from-time", default="", help="Begin timestamp")
+@click.option("--to-time", default="", help="End timestamp")
+@click.option("--task", default="", help="Task context for evolution")
+@click.option("--provider", default=None, help="LLM provider")
+@click.option("--model", default=None, help="Model override")
+@click.pass_context
+def trajectories_evolve(
+    ctx: click.Context,
+    source: str,
+    session: str,
+    label: str,
+    from_message: str,
+    to_message: str,
+    from_time: str,
+    to_time: str,
+    task: str,
+    provider: str | None,
+    model: str | None,
+) -> None:
+    """Evolve Protean skills from the selected trajectory slice."""
+    config: ProteanConfig = ctx.obj["config"]
+    slice_ = _resolve_cli_trajectory_slice(
+        config,
+        source=source,
+        session=session,
+        label=label,
+        from_message=from_message,
+        to_message=to_message,
+        from_time=from_time,
+        to_time=to_time,
+    )
+
+    async def _run() -> None:
+        import json
+
+        from protean.llm import create_llm_from_config
+        from protean.skills.evolve import SkillEvolver
+
+        llm = create_llm_from_config(config.llm_providers, config.default_provider, provider)
+        task_name = task or label or f"{source}-session"
+        trajectory = slice_.to_run_trajectory(
+            task_name=task_name,
+            verify_reason=f"Imported from {source} session slice: {slice_.session_path}",
+        )
+        evolver = SkillEvolver(
+            config.skills_dir,
+            llm,
+            model=model,
+            temperature=config.skill_temperature,
+        )
+        result = await evolver.evolve(
+            trajectory,
+            task_name=task_name,
+            task_context=task or trajectory.task,
+            used_skills=slice_.used_skills,
+        )
+        if result.skills_created or result.skills_refined or result.skills_deleted:
+            synced = _sync_installed_agents(config)
+            if synced:
+                click.echo(f"Synced to: {', '.join(synced)}", err=True)
+        click.echo(json.dumps({
+            "actions_taken": result.actions_taken,
+            "skills_created": result.skills_created,
+            "skills_refined": result.skills_refined,
+            "skills_deleted": result.skills_deleted,
+        }, ensure_ascii=False, indent=2))
+
+    asyncio.run(_run())
+
+
+@main.group()
+def agents() -> None:
+    """Set up external agent runtimes to use Protean."""
+    pass
+
+
+@agents.command("setup")
+@click.argument("target", type=click.Choice(["codex", "claude", "claude_code"]))
+@click.pass_context
+def agents_setup(
+    ctx: click.Context,
+    target: str,
+) -> None:
+    """Install Protean skills into Codex or Claude Code."""
+    config: ProteanConfig = ctx.obj["config"]
+    from protean.agent_setup import load_exportable_skill_pairs, resolve_agent_target, setup_agent
+
+    try:
+        agent_target = resolve_agent_target(target)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+
+    extra_pairs = load_exportable_skill_pairs(config.skills_dir)
+
+    result = setup_agent(
+        agent_target,
+        extra_skill_pairs=extra_pairs,
+    )
+    click.echo(f"Target: {result.target.display_name}")
+    click.echo(f"Skills dir: {result.bootstrap_path.parent.parent}")
+    click.echo(f"Agent skill: {result.bootstrap_path}")
+    if result.instructions_path is not None:
+        click.echo(f"Instructions: {result.instructions_path}")
+    if result.mcp_config_path is not None:
+        click.echo(f"MCP config: {result.mcp_config_path}")
+    if result.copied_skills:
+        click.echo("Copied Protean skills:")
+        for path in result.copied_skills:
+            click.echo(f"  {path.name}: {path}")
+    else:
+        click.echo("No additional Protean skills copied.")
+
+
+@agents.command("uninstall")
+@click.argument(
+    "target",
+    type=click.Choice(["codex", "claude", "claude_code", "all"]),
+)
+@click.pass_context
+def agents_uninstall(
+    ctx: click.Context,
+    target: str,
+) -> None:
+    """Remove Protean skills and managed instructions block from a runtime.
+
+    Pass ``all`` to uninstall from every runtime that has Protean installed.
+    """
+    config: ProteanConfig = ctx.obj["config"]
+    from protean.agent_setup import (
+        installed_agent_targets,
+        managed_skill_names,
+        resolve_agent_target,
+        uninstall_agent,
+    )
+
+    if target == "all":
+        targets = installed_agent_targets()
+        if not targets:
+            click.echo("No installed Protean agent runtimes found.")
+            return
+    else:
+        try:
+            targets = [resolve_agent_target(target)]
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+
+    skill_names = managed_skill_names(config.skills_dir)
+
+    for agent_target in targets:
+        result = uninstall_agent(agent_target, managed_skill_names=skill_names)
+        click.echo(f"Target: {result.target.display_name}")
+        if result.removed_bootstrap is not None:
+            click.echo(f"  Removed bootstrap skill: {result.removed_bootstrap}")
+        else:
+            click.echo("  Bootstrap skill: not installed")
+        if result.removed_skills:
+            click.echo("  Removed Protean skills:")
+            for path in result.removed_skills:
+                click.echo(f"    {path.name}: {path}")
+        else:
+            click.echo("  No additional Protean skills to remove.")
+        if result.instructions_path is not None:
+            verb = "Deleted" if result.instructions_file_deleted else "Cleaned"
+            click.echo(f"  {verb} instructions file: {result.instructions_path}")
+        else:
+            click.echo("  Instructions: no managed block to remove")
+        if result.mcp_config_path is not None:
+            click.echo(f"  Cleaned MCP config: {result.mcp_config_path}")
+        else:
+            click.echo("  MCP config: no managed entry to remove")
+
+
+@main.command("mcp")
+@click.pass_context
+def mcp(ctx: click.Context) -> None:
+    """Serve Protean's GUI tools as an MCP server over stdio.
+
+    Designed to be wired into external CLI agents (Codex, Claude Code,
+    ...) via their ``mcp_servers`` config. The server exposes Platform
+    methods — screenshot, click, type_text, key_press, scroll,
+    activate_app, get_active_window, get_clipboard — so the agent can
+    drive the GUI through Protean's tool surface instead of shelling out.
+    """
+    import asyncio
+
+    from mcp.server.stdio import stdio_server
+
+    from protean.mcp import build_mcp_server
+    from protean.platform import get_platform
+
+    server_config = build_mcp_server(get_platform())
+    server = server_config["instance"]
+    init_options = server.create_initialization_options()
+
+    async def _run() -> None:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, init_options)
 
     asyncio.run(_run())
 
@@ -1187,6 +1554,9 @@ def skills_run(
                                 click.secho(line, fg="cyan", dim=True)
                             else:
                                 click.echo(f"    {line[1:]}" if line.startswith(" ") else line)
+                        synced = _sync_installed_agents(config)
+                        if synced:
+                            click.echo(f"\nSynced to: {', '.join(synced)}")
                     else:
                         click.echo("\n── No changes after refinement ──")
         finally:

@@ -147,11 +147,15 @@ class FakeServer:
                     "displayName": "Tester",
                     "reservedAt": 0,
                 }
+            # The bridge's HeartbeatResponse type expects
+            # {success, result: {status, assignment, serverTime}}.
             return {
-                "serverStatus": self._server_status,
-                "assignment": assignment,
-                "shouldHangup": self._should_hangup,
-                "serverTime": 0,
+                "success": True,
+                "result": {
+                    "status": self._server_status,
+                    "assignment": assignment,
+                    "serverTime": 0,
+                },
             }
 
         if method == "POST" and path.endswith("/confirm"):
@@ -255,7 +259,9 @@ async def test_orchestrator_full_call_lifecycle(
             timeout=4.0,
             msg="first heartbeat",
         )
-        assert all(h["status"] == "IDLE" for h in fake_server.heartbeats)
+        # The bridge sends empty heartbeat bodies; presence/status flows
+        # the other way (server → bot via the response). Just verify the
+        # bridge is heartbeating at all.
 
         # 2. Activate assignment server-side.
         fake_server.set_assignment(True)

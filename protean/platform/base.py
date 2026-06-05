@@ -398,24 +398,18 @@ def _find_display_at(
 def active_display(platform: Platform) -> DisplayInfo | None:
     """Return the DisplayInfo for the display the user is working on.
 
-    Detection order: cursor position → active window center → primary → first.
-    Cursor is preferred because it reflects where the user is looking,
-    and is unaffected by tiny auxiliary windows on other displays.
+    Detection order: active window center → cursor position → primary → first.
+    The active window is preferred because the executor's most recent
+    ``activate_app(...)`` (or the user focusing a window) signals intent —
+    that app's display is the one we want to screenshot and click on.
+    Cursor is a weaker signal: in agent-driven sessions the user's hand
+    often stays on the chat display while the target app lives elsewhere.
     """
     displays = platform.get_displays()
     if not displays:
         return None
 
-    # Strategy 1: display containing cursor
-    try:
-        cx, cy = platform.get_cursor_position()
-        d = _find_display_at(displays, cx, cy)
-        if d is not None:
-            return d
-    except Exception:
-        pass
-
-    # Strategy 2: display containing active window center
+    # Strategy 1: display containing active window center
     window = platform.get_active_window()
     if window and window.width > 0 and window.height > 0:
         d = _find_display_at(
@@ -425,6 +419,15 @@ def active_display(platform: Platform) -> DisplayInfo | None:
         )
         if d is not None:
             return d
+
+    # Strategy 2: display containing cursor
+    try:
+        cx, cy = platform.get_cursor_position()
+        d = _find_display_at(displays, cx, cy)
+        if d is not None:
+            return d
+    except Exception:
+        pass
 
     # Strategy 3: primary display, then first
     for d in displays:

@@ -1,11 +1,13 @@
-"""Microphone recorder with energy-based VAD and (mock) ASR.
+"""Microphone recorder with energy-based VAD and ASR.
 
 Runs in a background thread alongside ``InputMonitor``. The PortAudio input
 stream feeds 16 kHz mono PCM into a small ring; a simple RMS-energy VAD
 slices it into utterances. Each utterance is:
 
   1. Written to ``audio/<NNNN>.wav`` under the recording dir.
-  2. Sent to ``transcribe()`` (mock — returns a placeholder string).
+  2. Sent to ``transcribe()`` (OpenAI-compatible /v1/audio/transcriptions
+     endpoint configured via ``PROTEAN_ASR_URL``; transcript is empty if
+     the env var is unset).
   3. Emitted as an ``InputEvent`` of type ``SPEECH`` via the same callback
      ``RecordingSession`` uses for keyboard / mouse events, so speech lands
      in ``events.json`` interleaved with everything else by ``timestamp``.
@@ -16,20 +18,17 @@ fails, it logs a warning and stays silent rather than crashing the recording.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import queue
 import threading
 import time
-import uuid
 import wave
 from collections.abc import Callable
 from pathlib import Path
-from urllib import request as urlrequest
-from urllib.error import HTTPError, URLError
 
 import numpy as np
+from openai import OpenAI
 
 from protean.recorder.events import EventType, InputEvent
 
@@ -51,119 +50,42 @@ _MAX_UTTERANCE_MS = 30_000
 # Pre-roll: keep this many ms before VAD trigger so we don't clip word onsets
 _PREROLL_MS = 200
 
-# ── ASR backend ────────────────────────────────────────────────────────────
-# OpenAI-compatible /v1/audio/transcriptions endpoint. Override via env var
-# PROTEAN_ASR_URL when the service moves. Empty string → fall back to mock.
-DEFAULT_ASR_URL = "http://10.224.120.166:8000/v1/audio/transcriptions"
+# ── ASR backend ──────────────────────────────────────────────
+# OpenAI-compatible ``/v1/audio/transcriptions`` endpoint. Set via env var
+# ``PROTEAN_ASR_URL`` (full URL including ``/v1/audio/transcriptions``).
+# No default — if unset, speech events are emitted without transcripts.
 _ASR_TIMEOUT_S = 30.0
-
-
-def _build_multipart(wav_path: Path, fields: dict[str, str]) -> tuple[bytes, str]:
-    """Build a multipart/form-data body for the ASR request.
-
-    Returns (body, content_type). Pure stdlib so we don't pull in `requests`
-    just for one upload.
-    """
-    boundary = f"----proteanboundary{uuid.uuid4().hex}"
-    crlf = b"\r\n"
-    parts: list[bytes] = []
-    for name, value in fields.items():
-        parts.append(f"--{boundary}".encode())
-        parts.append(
-            f'Content-Disposition: form-data; name="{name}"'.encode()
-        )
-        parts.append(b"")
-        parts.append(value.encode("utf-8"))
-    # File part
-    parts.append(f"--{boundary}".encode())
-    parts.append(
-        (
-            f'Content-Disposition: form-data; name="file"; '
-            f'filename="{wav_path.name}"'
-        ).encode()
-    )
-    parts.append(b"Content-Type: audio/wav")
-    parts.append(b"")
-    parts.append(wav_path.read_bytes())
-    parts.append(f"--{boundary}--".encode())
-    parts.append(b"")
-    body = crlf.join(parts)
-    return body, f"multipart/form-data; boundary={boundary}"
-
-
-def _parse_asr_response(raw: bytes) -> str:
-    """Pull the transcript text out of the ASR JSON response.
-
-    OpenAI-compatible endpoints return ``{"text": "..."}``. We also accept a
-    couple of common alternates so we don't break on a slightly different
-    server.  As a last resort we return the raw body decoded as UTF-8.
-    """
-    try:
-        data = json.loads(raw.decode("utf-8", errors="replace"))
-    except Exception:
-        return raw.decode("utf-8", errors="replace").strip()
-    if isinstance(data, dict):
-        for key in ("text", "transcript", "transcription"):
-            v = data.get(key)
-            if isinstance(v, str):
-                return v.strip()
-        # Some servers nest the result.
-        results = data.get("results")
-        if isinstance(results, list) and results:
-            first = results[0]
-            if isinstance(first, dict) and isinstance(first.get("text"), str):
-                return first["text"].strip()
-    return ""
+_ASR_MODEL = os.environ.get("PROTEAN_ASR_MODEL", "whisper-1")
 
 
 def transcribe(wav_path: Path) -> str:
-    """Send the WAV to the ASR HTTP endpoint and return the transcript text.
+    """Transcribe a WAV via the OpenAI-compatible ASR endpoint.
 
-    Endpoint: ``POST {PROTEAN_ASR_URL or DEFAULT_ASR_URL}`` as
-    ``multipart/form-data`` with fields ``file`` (the WAV) and
-    ``timestamps=false``. Mirrors:
-
-        curl -F 'file=@x.wav' -F timestamps=false \\
-             http://10.224.120.166:8000/v1/audio/transcriptions
-
-    Returns the empty string (and logs a warning) on any network/parse
-    failure so the SPEECH event is still emitted with audio_path/duration
-    even when ASR is unreachable.
+    Reads ``PROTEAN_ASR_URL`` (full transcriptions URL); the OpenAI SDK
+    needs the base ending in ``/v1``, so we strip the trailing path.
+    Returns the empty string on any failure (and when the env var is
+    unset) so the SPEECH event is still emitted with audio_path/duration.
     """
-    url = os.environ.get("PROTEAN_ASR_URL", DEFAULT_ASR_URL)
+    url = os.environ.get("PROTEAN_ASR_URL", "").strip()
     if not url:
-        return f"[mock transcript for {wav_path.name}]"
+        return ""
+
+    base_url = url.rsplit("/audio/transcriptions", 1)[0]
+    api_key = os.environ.get("PROTEAN_ASR_API_KEY") or "none"
 
     try:
-        body, content_type = _build_multipart(wav_path, {"timestamps": "false"})
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=_ASR_TIMEOUT_S)
+        with open(wav_path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                file=f,
+                model=_ASR_MODEL,
+                response_format="text",
+            )
     except Exception as e:
-        log.warning("ASR: failed to build multipart body for %s: %s", wav_path, e)
+        log.warning("ASR failed for %s: %s", wav_path.name, e)
         return ""
 
-    req = urlrequest.Request(url, data=body, method="POST")
-    req.add_header("Content-Type", content_type)
-    req.add_header("Content-Length", str(len(body)))
-    req.add_header("Accept", "application/json")
-
-    try:
-        with urlrequest.urlopen(req, timeout=_ASR_TIMEOUT_S) as resp:
-            raw = resp.read()
-    except HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode("utf-8", errors="replace")[:200]
-        except Exception:
-            pass
-        log.warning("ASR HTTP %s for %s: %s", e.code, wav_path.name, detail)
-        return ""
-    except (URLError, TimeoutError) as e:
-        log.warning("ASR network error for %s: %s", wav_path.name, e)
-        return ""
-    except Exception as e:
-        log.warning("ASR unexpected error for %s: %s", wav_path.name, e)
-        return ""
-
-    text = _parse_asr_response(raw)
+    text = str(result).strip()
     if not text:
         log.warning("ASR returned empty transcript for %s", wav_path.name)
     return text

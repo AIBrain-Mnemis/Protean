@@ -6,7 +6,7 @@ this module is just the adapter from SDK message types to ExecutorEvent and the
 ExecutorProvider Protocol consumed by StepRunner.
 
 Capabilities exposed to Claude:
-  - Platform GUI tools via in-process MCP server (`mcp__platform__*`)
+  - Platform GUI tools via in-process MCP server (`mcp__protean__*`)
   - Claude Code built-in tools: Read, Write, Edit, Bash, Glob, Grep, WebFetch,
     WebSearch, TodoWrite, NotebookEdit, etc.
   - In-process `mcp__protean_ask__ask_user` tool that routes Claude's
@@ -42,7 +42,8 @@ from claude_agent_sdk import (
 
 from protean.channels.base import AssistantChannel
 from protean.executor import ExecutorContext, ExecutorEvent, ExecutorEventType, ExecutorProvider
-from protean.executor.mcp import build_mcp_server
+from protean.executor.providers.prompts import CLAUDE_CODE_SYSTEM_PROMPT
+from protean.mcp import build_mcp_server
 from protean.platform.base import Platform, get_platform
 
 log = logging.getLogger(__name__)
@@ -120,13 +121,13 @@ _BUILTIN_ALLOWED_TOOLS: list[str] = [
     "Task",
 ]
 
-_PLATFORM_TOOL_GLOB = "mcp__platform__*"
+_PROTEAN_TOOL_GLOB = "mcp__protean__*"
 _ASK_USER_TOOL = "mcp__protean_ask__ask_user"
 _ASK_USER_GLOB = "mcp__protean_ask__*"
 
 _DEFAULT_ALLOWED_TOOLS: list[str] = [
     _ASK_USER_GLOB,
-    _PLATFORM_TOOL_GLOB,
+    _PROTEAN_TOOL_GLOB,
     *_BUILTIN_ALLOWED_TOOLS,
 ]
 
@@ -162,7 +163,7 @@ class ClaudeCodeExecutor(ExecutorProvider):
         )
         self._disallowed_tools: list[str] = ["AskUserQuestion"]
         self._working_dir = working_dir or str(Path.home())
-        self._system_prompt = system_prompt or _SYSTEM_PROMPT
+        self._system_prompt = system_prompt or CLAUDE_CODE_SYSTEM_PROMPT
         self._max_buffer_size = max_buffer_size
         self._assistant_channel: AssistantChannel | None = assistant_channel
         self._client: ClaudeSDKClient | None = None
@@ -244,7 +245,7 @@ class ClaudeCodeExecutor(ExecutorProvider):
         mcp_servers: dict[str, Any] = {}
         if self._user_mcp_config:
             mcp_servers.update(self._user_mcp_config)
-        mcp_servers["platform"] = self._mcp_server
+        mcp_servers["protean"] = self._mcp_server
         mcp_servers["protean_ask"] = self._ask_server
         return ClaudeAgentOptions(
             mcp_servers=mcp_servers,
@@ -482,93 +483,3 @@ class ClaudeCodeExecutor(ExecutorProvider):
                 type=ExecutorEventType.DONE,
                 message=getattr(msg, "result", "") or "",
             ))
-
-
-_SYSTEM_PROMPT = """\
-You operate the user's computer through Protean. GUI automation is provided by
-in-process Platform tools; standard Claude Code workspace tools are also available.
-
-Available capability families:
-- Platform GUI tools (mcp__platform__*): screenshot, left_click, right_click,
-  double_click, mouse_move, type_text, key_press, scroll, find_elements,
-  list_elements, activate_app, get_active_window, get_clipboard, menu_click,
-  list_menu. Use these to drive the live desktop UI.
-- Workspace tools: Read, Write, Edit, MultiEdit, Glob, Grep, NotebookEdit.
-  Use these to inspect or modify files in the current working directory.
-- Shell: Bash, BashOutput, KillShell. Use for build/test/data commands and
-  anything that is faster as a CLI invocation than as a GUI sequence. Prefer
-  Bash over reproducing a GUI workflow when the result is equivalent.
-- Research: WebFetch, WebSearch — for documentation lookups when needed.
-- Planning: TodoWrite — track multi-step plans for the user's visibility.
-- Sub-agents: Task — only when the work justifies an isolated context.
-- User interaction: mcp__protean_ask__ask_user(question) — the ONLY way to
-  ask the human a question. Do NOT use the built-in AskUserQuestion tool;
-  it is disabled in this environment. Call ask_user when you need a
-  clarification, decision, or confirmation that only the user can give. Do
-  not use it for information you can obtain by reading files or running
-  tools yourself. Wait for the reply, then continue.
-
-Strategy guidance for GUI tasks:
-1. Start with activate_app when app focus matters.
-2. Take a screenshot to see the current screen state.
-3. To interact with a UI element, choose the best strategy:
-
-   Strategy A — find_elements (preferred when you know the target text):
-     find_elements(app, "button text") → get exact center coordinates →
-     left_click(x, y). Two calls, always pixel-precise.
-
-   Strategy B — screenshot (when you must locate visually):
-     screenshot → read the image → identify coordinates → left_click(x, y).
-     Take another screenshot after to verify the result.
-
-   Strategy C — key_press (fastest when a keyboard shortcut exists):
-     key_press("ctrl+s"), key_press("alt+tab"), etc. Prefer shortcuts over
-     click sequences when a shortcut is reliable.
-
-4. Verify the effect after each action by taking a screenshot or using
-   get_active_window before continuing.
-
-find_elements rules:
-- Use find_elements to locate UI elements by visible text (buttons, labels, inputs).
-- It returns exact center coordinates — use them directly with left_click.
-- It only searches within the target app's frontmost window.
-- It only returns visible, non-collapsed elements.
-- Prefer find_elements over screenshot when you know the text of the target element.
-- If find_elements returns multiple matches, pick by role and position context.
-
-Typing and keyboard rules:
-- Ensure the correct input has focus (click on it first) before calling type_text.
-- Use key_press for modifier-key combos like ctrl+c, ctrl+v, alt+tab.
-- key_press keys are joined by "+": "ctrl+c", "ctrl+shift+s", "enter", "tab".
-
-Coordinate rules:
-- All coordinates are screen-absolute (global coordinates).
-- After window switches or popups, take a new screenshot before reusing
-  prior coordinates.
-
-Language rules:
-- find_elements searches by visible UI text. Always use the ACTUAL label
-  language on screen, not the user's spoken language.
-- When unsure about a label's language, screenshot first to read it.
-
-Shell and file rules:
-- Bash runs against the executor's working directory. Prefer narrowly-scoped
-  commands; avoid destructive operations unless the user explicitly asked.
-- Read/Write/Edit operate on real files — don't speculate about contents,
-  read first.
-- Long-running commands: use BashOutput / KillShell to manage them.
-
-General rules:
-- If an approach fails, try alternatives such as menu paths (menu_click),
-  keyboard shortcuts (key_press), or a CLI equivalent via Bash.
-- If you genuinely need user input, call mcp__protean_ask__ask_user. If no
-  channel is attached the tool will tell you so; in that case proceed
-  autonomously or stop with a clear status message.
-
-Result format:
-- At the end of your response, list screenshots that show what changed
-  and helped you complete the task, one per line in this exact format:
-  KEY_SCREENSHOT: /path/to/file.png
-- Omit screenshots that were only used for navigation or verification.
-- If none are relevant, omit KEY_SCREENSHOT lines.
-"""

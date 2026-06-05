@@ -179,8 +179,9 @@ def test_computer_use_reasoning_truncated_as_content_placeholder():
     # Empty reasoning
     assert executor._truncate_reasoning("") == ""
 
-    # Long reasoning truncated with marker
-    long = "x" * 300
+    # Long reasoning truncated with marker. Threshold is _REASONING_TRUNCATE
+    # (500); pick a size comfortably above it.
+    long = "x" * 600
     result = executor._truncate_reasoning(long)
     assert len(result) == 500 + len(" [truncated]")
     assert result.endswith(" [truncated]")

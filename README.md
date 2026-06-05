@@ -2,9 +2,9 @@
   <img src="assets/logo.png" alt="Protean logo" width="160">
 </p>
 
-# Protean: Show the work. Build the worker. 
+# Protean: Show the work. Build the worker.
 
-> Learn from everyday demonstrations, turn workflows into reusable multimodal skills, and help agents evolve into autonomous digital workers.
+> Protean extends agents beyond their native capabilities, turning everyday demonstrations into multimodal skills they can use across real work environments to automate, adapt, and evolve into autonomous digital workers.
 
 Protean is a skill infrastructure for agents like **Codex, Claude Code, OpenClaw**, and other agents.
 
@@ -68,11 +68,10 @@ Today Protean ships the desktop-automation slice of that vision end-to-end:
 - **Multi-provider LLM**: OpenAI, Anthropic, Gemini, and Doubao (Ark) for
   offline skill generation.
 - **Cross-platform tool suite**: `screenshot`, `click`, `click_at`,
-  `type_text`, `key_press`, `find_elements`, `activate_app`, `menu_click`,
-  `select_option`, `list_elements`, `list_menu` — driven directly by
-  `computer_use` (default), or exposed to external CLI agents
-  (`claude_code` via `-E claude_code`) through the in-process MCP surface
-  in `protean/executor/mcp.py`.
+  `type_text`, `key_press`, `activate_app`, `select_option` — driven
+  directly by `computer_use` (default), or exposed to external CLI
+  agents (`claude_code` via `-E claude_code`) through the in-process
+  MCP surface in `protean/mcp/server.py`.
 - **Step idempotency**: each step carries an `idempotent` flag; the validator
   retries idempotent failures and escalates the rest.
 - **Capture-proof overlay** (`--overlay`): floating log window invisible to
@@ -89,6 +88,12 @@ All human-editable, version-controllable, and shareable.
 - **Python 3.12 – 3.13** managed via [`uv`](https://docs.astral.sh/uv/).
 - **An LLM provider key** in `.env` (at least one of OpenAI / Anthropic /
   Gemini / Doubao).
+- **`ffmpeg` + `ffprobe` on PATH** — required by `generate` (frame
+  extraction, scene detection, audio mux) and by the recorder backends
+  (Windows screen capture, macOS audio capture).
+  - macOS: `brew install ffmpeg`
+  - Windows: `winget install Gyan.FFmpeg` (or `choco install ffmpeg`)
+  - Linux: `apt install ffmpeg` (or distro equivalent)
 - **macOS**: grant Accessibility + Screen Recording permissions to your
   terminal.
 - **Windows**: native input + UIA backend; no extra permissions, but run from
@@ -98,39 +103,66 @@ All human-editable, version-controllable, and shareable.
   - Node ≥ 18 is enough if you only use the Computer-Use Agent terminal tool
     (via DesktopCommanderMCP); opt out entirely with
     `PROTEAN_CUA_TERMINAL=false`.
+- **Claude Code CLI** on PATH (only if you use `-E claude_code`).
 
 ## Install
 
+The setup script bootstraps everything: clones the repo (if needed),
+offers to install `uv`, runs `uv sync`, creates `.env`, checks
+`ffmpeg`/Node, optionally builds the electron-bridge, and optionally
+wires Codex / Claude Code. Idempotent — safe to re-run for upgrades.
+
+Download and run from anywhere; it will clone Protean into `~/.protean`
+on first run:
+
 ```bash
-git clone <your-fork-url> protean
-cd protean
-uv sync
-cp .env.example .env
+# macOS / Linux
+bash <(curl -fsSL https://raw.githubusercontent.com/AIBrain-Mnemis/Protean/main/scripts/setup.sh)
+
+# Windows (PowerShell)
+iex (irm https://raw.githubusercontent.com/AIBrain-Mnemis/Protean/main/scripts/setup.ps1)
 ```
 
-Fill `.env` with the provider key(s) you intend to use. See
-[`.env.example`](.env.example) for every supported variable. For example:
+If you already cloned the repo manually, just run the script in place —
+it detects the checkout and skips the clone step:
 
-```env
-# Offline skill generation
-OPENAI_API_KEY=...           # or ANTHROPIC_API_KEY, GEMINI_API_KEY, ARK_API_KEY
-
-# Realtime voice session
-GEMINI_API_KEY=...
+```bash
+git clone https://github.com/AIBrain-Mnemis/Protean.git
+cd Protean
+./scripts/setup.sh        # or .\scripts\setup.ps1 on Windows
 ```
 
-Model selection:
+The script is interactive — every optional step (electron-bridge,
+external agent runtimes, provider keys) is a prompt. Press Enter to take
+the default shown in brackets. An existing `.env` is **never
+overwritten**: each provider/realtime/ASR section shows the current
+value and asks whether to change it.
 
-- **Offline generation** — any chat-completions model from a supported
-  provider; set via `*_MODEL` env vars or `-m` on `generate` / `skills run`.
-- **Realtime voice** — Gemini Live, configured via `PROTEAN_REALTIME_MODEL`
-  (e.g. `gemini-3.1-flash-live-preview`).
+To undo what setup did, run the matching teardown script from the
+checkout:
 
-See `protean/config.py` for the in-code default fallbacks.
+```bash
+# macOS / Linux
+./scripts/uninstall.sh
+
+# Windows (PowerShell)
+.\scripts\uninstall.ps1
+```
+
+Non-interactive: it unwires Codex / Claude Code, then removes
+`electron-bridge` build artifacts, `.venv`, `.env`, and the clone
+itself (only when running from `~/.protean`). Shared tools (uv, ffmpeg,
+node) are left alone.
+
+See [`.env.example`](.env.example) for every supported variable and
+[`protean/config.py`](protean/config.py) for the in-code default models.
 
 ## Usage
 
-All commands run via `uv run protean ...` — never bare `python`.
+After `setup.sh`, the `protean` command is on your PATH (via a shim at
+`~/.local/bin/protean` that delegates to the cloned repo's venv). All
+commands below use it directly.
+
 This section is organized by **entry channel** — pick the one that
 matches how you want capability to enter Protean.
 
@@ -140,8 +172,8 @@ Capture a session of you doing the task; an LLM turns the recording
 into a `Skill` afterwards.
 
 ```bash
-uv run protean record -o ./recordings/my-task   # Ctrl-C to stop
-uv run protean generate ./recordings/my-task -d "Create a calendar event"
+protean record -o ./recordings/my-task   # Ctrl-C to stop
+protean generate ./recordings/my-task -d "Create a calendar event"
 ```
 
 **Pass `-d "..."` on `generate`.** The task description grounds the LLM
@@ -154,8 +186,8 @@ itself doesn't take it.
 Other useful flags:
 
 ```bash
-uv run protean record -d 1                              # display 1
-uv run protean generate ./rec -d "..." -p anthropic -m claude-opus-4-6
+protean record -d 1                              # display 1
+protean generate ./rec -d "..." -p anthropic -m claude-opus-4-6
 ```
 
 **Tip:** for repeated recording, run the daemon (channel 2) and use the
@@ -168,15 +200,13 @@ recording, prompts you for the task description, and chains into
 Talk to a realtime LLM (Gemini Live, via the Electron bridge) and share
 screens in either direction — the agent can watch you work
 (`start_screen(mode="observe")`), or share its own screen for you to
-watch it work (`start_screen(mode="share")`). The bridge has to be built
-first — see
-**[Bridge setup](#bridge-setup-one-time-prerequisite-for-channel-2)**
-below — then start the daemon:
+watch it work (`start_screen(mode="share")`). Build the bridge once with
+`setup.sh` (it prompts), then start the daemon:
 
 ```bash
-uv run protean daemon
-uv run protean daemon --overlay         # add the capture-proof overlay
-uv run protean daemon -p anthropic -m claude-opus-4-6   # generation provider
+protean daemon
+protean daemon --overlay         # add the capture-proof overlay
+protean daemon -p anthropic -m claude-opus-4-6   # generation provider
 ```
 
 The daemon supervises the bridge subprocess and combines two flows:
@@ -189,18 +219,14 @@ The daemon supervises the bridge subprocess and combines two flows:
    configured presence/RTC service, the bridge fires a `ringing` event
    and the daemon auto-starts a `TeachSession`.
 
-If you skip bridge config, the bridge falls back to
-`transport.local_mock` — you can exercise the full session lifecycle
-without a real RTC service.
-
 ### 3. Zero-shot task prompt
 
 Skip the skill creation step entirely. Hand the agent a natural-language
 task and let it figure out execution from scratch.
 
 ```bash
-uv run protean skills run -t "Open Calculator and compute 1+1"
-uv run protean skills run -t "..." --overlay
+protean skills run -t "Open Calculator and compute 1+1"
+protean skills run -t "..." --overlay
 ```
 
 Useful for one-off tasks, or to see whether the executor can handle the
@@ -210,7 +236,7 @@ shape of the work before you invest in capturing a skill.
 
 Skills live as directories under your skills directory
 (`PROTEAN_SKILLS_DIR`). Open `SKILL.md` in any editor, change steps /
-verify conditions / idempotency flags, save. `uv run protean skills
+verify conditions / idempotency flags, save. `protean skills
 list` picks up changes immediately.
 
 ### 5. Import another deployment's skill library
@@ -226,22 +252,63 @@ feeds back into `SkillBuilder.refine()`, which uses an LLM to sharpen
 the skill before the next run.
 
 ```bash
-uv run protean skills run my-skill --refine
+protean skills run my-skill --refine
 ```
+
+### Equip an external agent (Codex / Claude Code)
+
+If you ran `setup.sh` and answered yes when it offered to wire Codex /
+Claude Code, **this is already done** — skip to the re-sync note below.
+
+Otherwise, run `agents setup` to make **Codex** or **Claude Code** invoke
+Protean from inside its own sessions. It copies the local skill library
+into the runtime's skills directory and injects a sentinel-delimited
+block into the runtime's session-start instructions file
+(`~/.codex/AGENTS.md` for Codex, `~/.claude/CLAUDE.md` for Claude Code)
+that tells the model to load the Protean bootstrap skill at the start
+of every new chat.
+
+```bash
+protean agents setup codex
+protean agents setup claude_code
+```
+
+Re-run the same command after updating Protean to refresh the bootstrap
+skill and resync the library — the sentinel block is replaced in place
+without touching the rest of your instructions file. Most pipelines
+(`generate`, `daemon` hotkey, `trajectories evolve`, `skills run
+--refine`) also auto-resync every installed runtime, so you usually
+don't need to re-run setup by hand.
+
+To remove Protean from a runtime:
+
+```bash
+protean agents uninstall codex
+protean agents uninstall all       # every installed runtime
+```
+
+Uninstall removes only the Protean-managed skill folders (never
+user-authored skills sitting alongside) and strips the sentinel block
+from the instructions file, deleting the file entirely if nothing else
+remains. Idempotent and safe to re-run.
+
+For a full teardown that also cleans the electron-bridge build, `.venv`,
+`.env`, and the cloned repo, run [`./scripts/uninstall.sh`](scripts/uninstall.sh)
+(or `scripts\uninstall.ps1` on Windows).
 
 ### Running and managing skills
 
 ```bash
-uv run protean skills list                          # list installed skills
-uv run protean skills show SKILL_NAME               # inspect SKILL.md
-uv run protean skills run SKILL_NAME                # replay end-to-end
-uv run protean skills run SKILL_NAME -v             # stream executor events
-uv run protean skills run SKILL_NAME -E claude_code # use Claude Code executor
-uv run protean skills run SKILL_NAME --overlay      # capture-proof overlay
-uv run protean skills run SKILL_NAME -p key=val     # parameterized
+protean skills list                          # list installed skills
+protean skills show SKILL_NAME               # inspect SKILL.md
+protean skills run SKILL_NAME                # replay end-to-end
+protean skills run SKILL_NAME -v             # stream executor events
+protean skills run SKILL_NAME -E claude_code # use Claude Code executor
+protean skills run SKILL_NAME --overlay      # capture-proof overlay
+protean skills run SKILL_NAME -p key=val     # parameterized
 ```
 
-Further flags (run `uv run protean skills run --help` for the full list):
+Further flags (run `protean skills run --help` for the full list):
 
 - `-s / --stepwise` — execute and verify each step individually
   (drives Skill lifecycle § 4 *Validate*).
@@ -267,19 +334,9 @@ Protean ships two executor backends; pick with `-E` on `daemon` and
   Needs the Claude Code CLI on `PATH` and an `ANTHROPIC_API_KEY`. The
   SDK manages the CLI subprocess; Protean's Platform tools are exposed
   to it through the in-process MCP surface in
-  `protean/executor/mcp.py`. Same tool surface, different driver loop.
+  `protean/mcp/server.py`. Same tool surface, different driver loop.
 
-### Bridge setup (one-time prerequisite for channel 2)
-
-The realtime path is owned by the `electron-bridge` Node subproject.
-Build it once:
-
-```bash
-cd electron-bridge
-npm install
-npm run build
-cd ..
-```
+### Bridge env vars (channel 2)
 
 Realtime model selection lives in bridge-side env (set in `.env`):
 
@@ -288,12 +345,6 @@ PROTEAN_BRIDGE_REALTIME=gemini
 GEMINI_API_KEY=...
 PROTEAN_REALTIME_MODEL=gemini-3.1-flash-live-preview
 ```
-
-Without `PROTEAN_BRIDGE_REALTIME` or `GEMINI_API_KEY` the bridge falls
-back to a local mock realtime — useful for IPC development without a
-model. Without `PROTEAN_PRESENCE_URL` it also runs in
-`transport.local_mock` mode, so you can exercise the full session
-lifecycle without a real RTC service.
 
 ## Skill lifecycle
 
@@ -354,7 +405,7 @@ Layer roles:
   internal agent that calls Platform directly) and `claude_code` (Claude
   Code CLI via `claude-agent-sdk`, an external CLI agent). External CLI
   executors plug into Platform through the in-process MCP surface in
-  `protean/executor/mcp.py`.
+  `protean/mcp/server.py`.
 - **`protean/channels/`** — `AssistantChannel` protocol + the Electron-bridge
   IPC client (TypeScript schema is mirrored 1:1 in
   [`electron-bridge/src/protocol.ts`](electron-bridge/src/protocol.ts) and
@@ -366,16 +417,6 @@ Layer roles:
   LLM.
 - **`protean/skills/`** — schema, renderer, registry, builder, runner,
   verifier, refiner.
-
-### Screen modes
-
-The realtime path distinguishes two directions explicitly:
-
-- `start_screen(mode="observe")` — the user shares their screen *to* the agent.
-- `start_screen(mode="share")` — the agent shares its screen *to* the user.
-
-Use `stop_screen()` to end the current mode. The agent receives no
-screenshots until screen handling is started.
 
 ## Roadmap
 
@@ -391,12 +432,9 @@ Things known to be incomplete:
 - **Cross-run skill evolution.** Aggregating trajectories across many runs to
   evolve a skill more aggressively than per-run `refine()`.
 - **Drag toolkit function** — `drag(app, from_label, to_label)`.
-- **Setup wizard / dependency checker** — currently you eyeball
-  `.env.example` and Node/uv installs by hand.
 
 ## Development
 
-- Use `uv run protean ...`, not bare `python -m protean`.
 - Lint: `uv run ruff check protean tests`.
 - Tests: `uv run pytest` (async tests work without decorators —
   `asyncio_mode = "auto"`).

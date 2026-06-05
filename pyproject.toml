@@ -35,6 +35,7 @@ dependencies = [
     "pyobjc-framework-Cocoa>=10.0;               sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=10.0;              sys_platform == 'darwin'",
     "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
+    "tomlkit>=0.15.0",
 ]
 
 [project.optional-dependencies]
@@ -49,9 +50,6 @@ macos = [
 windows = [
     "pywin32>=306",         # Win32 API wrappers (window mgmt, clipboard, process)
     "uiautomation>=2.0.20", # Microsoft UI Automation (accessibility tree)
-]
-video = [
-    "ffmpeg-python>=0.2",   # video recording/analysis via ffmpeg
 ]
 [project.scripts]
 protean = "protean.cli:main"

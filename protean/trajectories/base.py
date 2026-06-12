@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from dataclasses import dataclass, field
@@ -40,7 +41,57 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return events
 
 
+def _is_image_item(item: dict[str, Any]) -> bool:
+    """Detect image content blocks across Codex session formats."""
+    return item.get("type") in ("image", "input_image")
+
+
+def _extract_image_bytes(item: dict[str, Any]) -> tuple[bytes, str] | None:
+    """Extract (data, mime) from an image content block.
+
+    Handles three session formats:
+      - Codex function_call_output:
+        {"type": "input_image", "image_url": "data:mime;base64,..."}
+      - MCP tool_call_end:
+        {"type": "image", "data": "<base64>", "mimeType": "image/jpeg"}
+      - Claude Code tool_result:
+        {"type": "image", "source": {"type": "base64", "media_type": ..., "data": ...}}
+    """
+    t = item.get("type", "")
+    if t == "input_image":
+        url = item.get("image_url", "")
+        if isinstance(url, str) and url.startswith("data:"):
+            # data:image/jpeg;base64,<data>
+            header, _, b64 = url.partition(",")
+            mime = header.removeprefix("data:").partition(";")[0]
+            try:
+                return base64.b64decode(b64), mime or "image/jpeg"
+            except Exception:
+                return None
+    elif t == "image":
+        # Anthropic source-envelope format (Claude Code)
+        source = item.get("source")
+        if isinstance(source, dict) and source.get("type") == "base64":
+            raw = source.get("data", "")
+            mime = source.get("media_type") or "image/jpeg"
+            if isinstance(raw, str) and raw:
+                try:
+                    return base64.b64decode(raw), mime
+                except Exception:
+                    return None
+        # MCP flat format
+        raw = item.get("data", "")
+        mime = item.get("mimeType") or "image/jpeg"
+        if isinstance(raw, str) and raw:
+            try:
+                return base64.b64decode(raw), mime
+            except Exception:
+                return None
+    return None
+
+
 def stringify_content(value: Any) -> str:
+    """Extract text from structured content, replacing images with [screenshot]."""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -50,12 +101,44 @@ def stringify_content(value: Any) -> str:
         for item in value:
             if isinstance(item, dict) and isinstance(item.get("text"), str):
                 parts.append(item["text"])
+            elif isinstance(item, dict) and _is_image_item(item):
+                parts.append("[screenshot]")
             elif isinstance(item, str):
                 parts.append(item)
             else:
                 parts.append(json.dumps(item, ensure_ascii=False))
         return "\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        # mcp_tool_call_end wraps content in {"Ok": {"content": [...]}}
+        ok = value.get("Ok")
+        if isinstance(ok, dict):
+            content = ok.get("content")
+            if isinstance(content, list):
+                return stringify_content(content)
+        return json.dumps(value, ensure_ascii=False)
     return json.dumps(value, ensure_ascii=False)
+
+
+def extract_images(value: Any) -> list[tuple[bytes, str]]:
+    """Extract image bytes from structured content.
+
+    Returns list of (data, mime) tuples.
+    """
+    if isinstance(value, list):
+        images: list[tuple[bytes, str]] = []
+        for item in value:
+            if isinstance(item, dict) and _is_image_item(item):
+                pair = _extract_image_bytes(item)
+                if pair:
+                    images.append(pair)
+        return images
+    if isinstance(value, dict):
+        ok = value.get("Ok")
+        if isinstance(ok, dict):
+            content = ok.get("content")
+            if isinstance(content, list):
+                return extract_images(content)
+    return []
 
 
 @dataclass
@@ -66,6 +149,8 @@ class CallRecord:
     tool_args: dict[str, Any] = field(default_factory=dict)
     result: str = ""
     result_timestamp: str = ""
+    images: list[tuple[bytes, str, str]] = field(default_factory=list)  # [(data, mime, role)]
+    from_mcp: bool = False
 
 
 @dataclass
@@ -133,6 +218,8 @@ class SessionSlice:
 class SessionAdapter(Protocol):
     source: str
     session_path: Path
+
+    def __init__(self, session_path: Path) -> None: ...
 
     @staticmethod
     def resolve_session(session: str = "current") -> Path: ...

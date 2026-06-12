@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from pathlib import Path
 
 from protean.executor.providers.computer_use import ComputerUseExecutor
-from protean.platform.base import DisplayInfo, WindowInfo
+from protean.platform.base import ClipboardContent, DisplayInfo, ElementInfo, WindowInfo
 from protean.realtime.tool_handlers import execute_tool
 
 
@@ -15,6 +17,10 @@ class FakePlatform:
             ("Microsoft Teams", "Share"): (2200, 260),
         }
 
+    @property
+    def name(self) -> str:
+        return "test"
+
     def get_active_window(self) -> WindowInfo | None:
         return WindowInfo(
             pid=123,
@@ -25,6 +31,9 @@ class FakePlatform:
             width=1200,
             height=800,
         )
+
+    def get_window_at_point(self, x: int, y: int) -> WindowInfo | None:
+        return self.get_active_window()
 
     def list_windows(self) -> list[WindowInfo]:
         return []
@@ -58,7 +67,13 @@ class FakePlatform:
         return 0, 0
 
     def start_screen_recording(
-        self, output_path, display_index=1, *, show_clicks=True, capture_audio=False) -> None:
+        self,
+        output_path,
+        display_index=1,
+        *,
+        show_clicks=True,
+        capture_audio=False,
+    ) -> None:
         raise NotImplementedError
 
     def stop_screen_recording(self):
@@ -67,11 +82,20 @@ class FakePlatform:
     def click(self, x: int, y: int, button: str = "left") -> None:
         self.clicked_points.append((x, y))
 
+    def double_click(self, x: int, y: int) -> None:
+        self.clicked_points.append((x, y))
+
     def move_cursor(self, x: int, y: int) -> None:
+        return None
+
+    def scroll(self, x: int, y: int, direction: str = "down", amount: int = 3) -> None:
         return None
 
     def type_text(self, text: str) -> None:
         return None
+
+    def get_clipboard(self) -> ClipboardContent:
+        return ClipboardContent()
 
     def key_press(self, *keys: str) -> None:
         return None
@@ -94,11 +118,26 @@ class FakePlatform:
     def list_elements(self, app: str, max_depth: int = 8) -> list[str]:
         return []
 
+    def find_elements(self, app: str, query: str) -> list[ElementInfo]:
+        return []
+
+    def element_at(self, x: int, y: int) -> ElementInfo | None:
+        return None
+
+    def element_focused(self) -> ElementInfo | None:
+        return None
+
+    def get_element_role(self, app: str, label: str) -> str | None:
+        return None
+
     def activate_app(self, app: str) -> None:
         self.activated_apps.append(app)
 
     def notify(self, title: str, message: str, *, sound: bool = True) -> None:
         return None
+
+    def keep_awake(self):
+        return contextlib.nullcontext()
 
     def prompt_text(
         self, title: str, placeholder: str = "", message: str = "",
@@ -108,9 +147,9 @@ class FakePlatform:
     def register_hotkey(self, keys, callback):
         raise NotImplementedError
 
-    def capture_display(self, display_index, path):
+    def capture_display(self, display_index: int, output_path: Path) -> None:
         from PIL import Image
-        Image.new("RGB", (100, 100), (0, 0, 0)).save(str(path))
+        Image.new("RGB", (100, 100), (0, 0, 0)).save(str(output_path))
 
 
 def test_activate_app_reports_display(monkeypatch):
@@ -153,17 +192,15 @@ def test_computer_use_tool_error_includes_schema_hint():
         "Received input: {\"x\": \"269, 959\"}. "
         "Expected schema: {\"properties\": {"
         "\"x\": {\"description\": \"X coordinate (0-1023)\", \"type\": \"integer\"}, "
-        "\"y\": {\"description\": \"Y coordinate (0-767)\", \"type\": \"integer\"}}, "
+        "\"y\": {\"description\": \"Y coordinate (0 to screenshot height - 1)\", "
+        "\"type\": \"integer\"}}, "
         "\"required\": [\"x\", \"y\"], \"type\": \"object\"}. "
         "Hint: Pass x and y as separate integer fields, "
         "not as a single comma-separated string, "
         "for example {\"x\": 100, \"y\": 200}."
     )
 
-    assert result == [{
-        "type": "text",
-        "text": expected,
-    }]
+    assert result.text == expected
 
 
 def test_computer_use_reasoning_truncated_as_content_placeholder():

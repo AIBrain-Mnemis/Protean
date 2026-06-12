@@ -95,6 +95,7 @@ class ExecutorAction:
     tool_args: dict = field(default_factory=dict)
     result: str = ""          # tool result or text message
     event_type: str = ""      # "tool_call", "tool_result", "message"
+    images: list[tuple[bytes, str, str]] = field(default_factory=list)  # [(data, mime, role)]
 
 
 @dataclass

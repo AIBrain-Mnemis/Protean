@@ -137,10 +137,12 @@ class TrajectoryAdapter:
                 continue
 
             if etype == "tool_result":
+                images = event.get("images") or []
                 actions.append(ExecutorAction(
                     tool_name=str(event.get("tool_name") or ""),
                     result=str(event.get("result") or ""),
                     event_type="tool_result",
+                    images=images,
                 ))
 
         return actions, instruction, final_response

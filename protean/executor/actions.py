@@ -87,11 +87,6 @@ class ActionExecutor:
     def __init__(self, platform: Platform, mapper: CoordinateMapper) -> None:
         self._platform = platform
         self._mapper = mapper
-        # ``api_w``/``api_h`` are set when the mapper is constructed and
-        # don't change across ``refresh()`` calls, so reading them once is
-        # safe.
-        self._display_width = mapper.scale.api_w
-        self._display_height = mapper.scale.api_h
         # Last full screenshot at API resolution. ``detail_crop`` reads
         # it so it doesn't re-capture.
         self._last_img: Image.Image | None = None
@@ -107,6 +102,7 @@ class ActionExecutor:
         zoom without re-capturing.
         """
         self._mapper.refresh()
+        scale = self._mapper.scale
         tmp = Path(tempfile.gettempdir()) / f"protean_actions_{time.monotonic_ns()}.png"
         try:
             self._platform.capture_display(self._mapper.display_index, tmp)
@@ -115,13 +111,19 @@ class ActionExecutor:
             tmp.unlink(missing_ok=True)
         jpeg_bytes, _ = prepare_screenshot_for_llm(
             raw_bytes,
-            max_width=self._display_width,
-            max_height=self._display_height,
+            max_width=scale.api_w,
+            max_height=scale.api_h,
             quality=LLM_JPEG_QUALITY,
             exact_size=True,
         )
         self._last_img = Image.open(io.BytesIO(jpeg_bytes)).copy()
         return base64.b64encode(jpeg_bytes).decode("ascii")
+
+    def screenshot_result(self, text: str | None = None) -> ActionResult:
+        screenshot_b64 = self.take_screenshot()
+        context = self._screenshot_context_text()
+        result_text = context if text is None else f"{text}. {context}"
+        return ActionResult(text=result_text, screenshot_b64=screenshot_b64)
 
     def detail_crop(self, cx: int, cy: int) -> str | None:
         """Return base64 JPEG of a 2x zoom around (cx, cy) with a coord grid.
@@ -136,9 +138,9 @@ class ActionExecutor:
             return None
 
         img = self._last_img
-        crop_r = max(1, max(self._display_width, self._display_height) // 8)
         step = DETAIL_GRID_STEP
         full_w, full_h = img.size
+        crop_r = max(1, max(full_w, full_h) // 8)
         x1, y1 = max(0, cx - crop_r), max(0, cy - crop_r)
         x2, y2 = min(full_w, cx + crop_r), min(full_h, cy + crop_r)
         crop = img.crop((x1, y1, x2, y2))
@@ -218,7 +220,7 @@ class ActionExecutor:
         msg = f"Typed: {text!r}"
         if not include_screenshot:
             return ActionResult(text=msg)
-        return ActionResult(text=msg, screenshot_b64=self.take_screenshot())
+        return self.screenshot_result(msg)
 
     async def key_press(
         self, keys_str: str, *, include_screenshot: bool = True,
@@ -229,7 +231,7 @@ class ActionExecutor:
         msg = f"Pressed: {keys_str}"
         if not include_screenshot:
             return ActionResult(text=msg)
-        return ActionResult(text=msg, screenshot_b64=self.take_screenshot())
+        return self.screenshot_result(msg)
 
     # ─── actions: scroll ───────────────────────────────────────────────
 
@@ -256,7 +258,7 @@ class ActionExecutor:
 
     def screenshot(self) -> ActionResult:
         """Take a screenshot as its own action (no text confirmation)."""
-        return ActionResult(screenshot_b64=self.take_screenshot())
+        return self.screenshot_result()
 
     # ─── actions: app / window / clipboard ─────────────────────────────
 
@@ -277,7 +279,7 @@ class ActionExecutor:
             msg = f"Activated {app}"
         if not include_screenshot:
             return ActionResult(text=msg)
-        return ActionResult(text=msg, screenshot_b64=self.take_screenshot())
+        return self.screenshot_result(msg)
 
     def get_active_window(self) -> ActionResult:
         win = self._platform.get_active_window()
@@ -317,9 +319,18 @@ class ActionExecutor:
         msg = f"Waited {seconds}s"
         if not include_screenshot:
             return ActionResult(text=msg)
-        return ActionResult(text=msg, screenshot_b64=self.take_screenshot())
+        return self.screenshot_result(msg)
 
     # ─── internals ────────────────────────────────────────────────────
+
+    def _screenshot_context_text(self) -> str:
+        if self._last_img is None:
+            raise RuntimeError("screenshot context requested before screenshot capture")
+        width, height = self._last_img.size
+        return (
+            f"Screenshot: display {self._mapper.display_index}, size {width}x{height}, "
+            f"x=0..{width - 1}, y=0..{height - 1}."
+        )
 
     def _coord_result(
         self, base_text: str, ix: int, iy: int, include_screenshot: bool,
@@ -333,10 +344,13 @@ class ActionExecutor:
         if not include_screenshot:
             return ActionResult(text=base_text)
         ss = self.take_screenshot()
+        context = self._screenshot_context_text()
         crop = self.detail_crop(ix, iy)
         caption: str | None = None
         if crop is not None:
-            w, h = self._display_width, self._display_height
+            if self._last_img is None:
+                raise RuntimeError("detail caption requested before screenshot capture")
+            w, h = self._last_img.size
             crop_r = max(1, max(w, h) // 8)
             x1, y1 = max(0, ix - crop_r), max(0, iy - crop_r)
             x2, y2 = min(w, ix + crop_r), min(h, iy + crop_r)
@@ -345,7 +359,7 @@ class ActionExecutor:
                 f"region x={x1}..{x2}, y={y1}..{y2}, with coordinate grid overlay]"
             )
         return ActionResult(
-            text=f"{base_text}. Result screenshot below.",
+            text=f"{base_text}. {context}",
             screenshot_b64=ss,
             detail_crop_b64=crop,
             detail_caption=caption,
@@ -507,9 +521,14 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
         name="left_click",
         description=(
             "Click the left mouse button at the given (x, y) pixel coordinates. "
-            "Coordinates are relative to the screenshot image (1024x768)."
+            "Coordinates are relative to the screenshot image. The image is "
+            "1024 px wide and preserves the active display's aspect ratio; "
+            "each screenshot result states its exact size and valid ranges."
         ),
-        input_schema=_coord_schema("X coordinate (0-1023)", "Y coordinate (0-767)"),
+        input_schema=_coord_schema(
+            "X coordinate (0-1023)",
+            "Y coordinate (0 to screenshot height - 1)",
+        ),
     ),
     ToolSpec(
         name="right_click",

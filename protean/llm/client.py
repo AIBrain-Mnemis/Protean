@@ -9,7 +9,6 @@ Only 2 dependencies, both officially maintained with security audits.
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 from dataclasses import dataclass, field
@@ -19,46 +18,25 @@ import anthropic
 import openai
 from pydantic import BaseModel, ValidationError
 
-from protean.config import (
-    DEFAULT_MAX_TOKENS,
-    DEFAULT_MODEL_ANTHROPIC,
-    DEFAULT_MODEL_DOUBAO,
-    DEFAULT_MODEL_GEMINI,
-    DEFAULT_MODEL_OPENAI,
+from protean.config import DEFAULT_MAX_TOKENS
+from protean.llm.context import ContextOverflowError, is_context_overflow
+from protean.llm.messages import (
+    build_anthropic_messages,
+    build_openai_messages,
+    build_responses_input,
+    extract_responses_text,
+    parse_structured_text,
+    strict_json_schema,
+)
+from protean.llm.providers import (
+    ANTHROPIC_DEFAULTS,
+    OPENAI_COMPATIBLE_DEFAULTS,
+    OPENAI_FALLBACK_DEFAULTS,
 )
 
 T = TypeVar("T", bound=BaseModel)
 
 log = logging.getLogger(__name__)
-
-
-class ContextOverflowError(Exception):
-    """Provider rejected the request for exceeding the model's context window.
-
-    Normalized across Anthropic / OpenAI / Gemini error shapes so callers
-    (e.g. SkillBuilder's degrade-and-retry loop) can react without
-    substring-matching every provider's error format.
-    """
-
-
-def _is_context_overflow(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    needles = (
-        "context_length_exceeded",
-        "prompt is too long",
-        "maximum context length",
-        "string too long",
-        "request payload size",
-        "too many tokens",
-        "input is too long",
-        "exceeds the maximum",
-    )
-    if any(n in msg for n in needles):
-        return True
-    code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-    if code in (400, "400") and ("token" in msg or "context" in msg):
-        return True
-    return False
 
 
 @dataclass
@@ -69,270 +47,6 @@ class LLMResponse:
     model: str
     usage: dict[str, int] = field(default_factory=dict)
     raw: Any = None
-
-
-# ── Provider registry ────────────────────────────────────
-
-# Map of known providers to their OpenAI-compatible base URLs.
-# Anthropic is handled separately via its own SDK.
-_OPENAI_COMPATIBLE_DEFAULTS: dict[str, dict[str, Any]] = {
-    "openai": {
-        "base_url": "https://api.openai.com/v1",
-        "model": DEFAULT_MODEL_OPENAI,
-        "api": "responses",  # Responses API
-    },
-    "doubao": {
-        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
-        "model": DEFAULT_MODEL_DOUBAO,
-        "api": "chat",  # Chat Completions API
-    },
-    "gemini": {
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "model": DEFAULT_MODEL_GEMINI,
-        "api": "chat",
-    },
-}
-
-_ANTHROPIC_DEFAULTS: dict[str, str] = {
-    "model": DEFAULT_MODEL_ANTHROPIC,
-}
-
-
-def _build_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert our message format to Responses API input format."""
-    result = []
-    for msg in messages:
-        role = msg["role"]
-        content = msg.get("content", "")
-        msg_images = msg.get("images")
-
-        if role == "system":
-            result.append({"role": "system", "content": content})
-        elif isinstance(content, list):
-            # Interleaved content parts: [{"type": "text", ...}, {"type": "image", ...}]
-            parts: list[dict[str, Any]] = []
-            for part in content:
-                if part["type"] == "text":
-                    parts.append({"type": "input_text", "text": part["text"]})
-                elif part["type"] == "image":
-                    b64 = base64.b64encode(part["data"]).decode("ascii")
-                    parts.append({
-                        "type": "input_image",
-                        "image_url": f"data:{part['mime']};base64,{b64}",
-                        "detail": "auto",
-                    })
-            result.append({"role": role, "content": parts})
-        elif msg_images:
-            parts = [{"type": "input_text", "text": content}]
-            for img_data, media_type in msg_images:
-                b64 = base64.b64encode(img_data).decode("ascii")
-                parts.append(
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:{media_type};base64,{b64}",
-                        "detail": "auto",
-                    }
-                )
-            result.append({"role": role, "content": parts})
-        else:
-            result.append({"role": role, "content": content})
-    return result
-
-
-def _extract_responses_text(resp: Any) -> str:
-    """Extract text content from a Responses API response."""
-    for item in getattr(resp, "output", []):
-        if getattr(item, "type", "") == "message":
-            for part in getattr(item, "content", []):
-                if getattr(part, "type", "") == "output_text":
-                    return part.text
-    return ""
-
-
-def _parse_structured_text(content: str, response_model: type[BaseModel]) -> Any:
-    """Parse JSON from a model response that may be wrapped in markdown
-    fences or have a leading prose preamble. Some OpenAI-compatible servers
-    ignore json_schema response_format and return ``## Header ... { ... }``
-    or fenced ``` ```json blocks instead of raw JSON.
-    """
-    text = (content or "").strip()
-    # Strip ``` fences if present.
-    if text.startswith("```"):
-        lines = text.split("\n")
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    # Try direct parse first.
-    try:
-        return response_model.model_validate_json(text)
-    except Exception:
-        pass
-    # Fall back to extracting the largest balanced {...} block.
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
-        candidate = text[start : end + 1]
-        return response_model.model_validate_json(candidate)
-    # Re-raise the original error by attempting one more parse.
-    return response_model.model_validate_json(text)
-
-
-def _strict_json_schema(model: type[BaseModel]) -> dict:
-    """Convert Pydantic schema to OpenAI strict mode.
-
-    Strict mode requires:
-    - additionalProperties: false on all objects
-    - All properties in "required"
-    - No $ref with sibling keywords
-    """
-    schema = model.model_json_schema()
-    defs = schema.pop("$defs", {})
-
-    # Remove fields marked with exclude_from_llm (system-only fields like
-    # metadata: dict[str, Any] which can't satisfy additionalProperties: false)
-    if "properties" in schema:
-        to_remove = [
-            name
-            for name, prop in schema["properties"].items()
-            if isinstance(prop, dict) and prop.get("exclude_from_llm")
-        ]
-        for name in to_remove:
-            del schema["properties"][name]
-
-    def _resolve(obj: Any) -> Any:
-        if isinstance(obj, dict):
-            # Inline $ref
-            if "$ref" in obj:
-                ref_name = obj["$ref"].split("/")[-1]
-                resolved = defs.get(ref_name, {}).copy()
-                # Merge any sibling keys (like "description", "default") into resolved
-                for k, v in obj.items():
-                    if k != "$ref":
-                        resolved[k] = v
-                return _resolve(resolved)
-            result = {}
-            for k, v in obj.items():
-                result[k] = _resolve(v)
-            # Add strict constraints to objects
-            if result.get("type") == "object" and "properties" in result:
-                result["additionalProperties"] = False
-                result["required"] = list(result["properties"].keys())
-            return result
-        if isinstance(obj, list):
-            return [_resolve(item) for item in obj]
-        return obj
-
-    return _resolve(schema)
-
-
-def _add_strict_props(obj: dict) -> None:
-    """Add additionalProperties: false and make all properties required for strict mode."""
-    if obj.get("type") == "object" and "properties" in obj:
-        obj["additionalProperties"] = False
-        obj["required"] = list(obj["properties"].keys())
-
-
-def _build_openai_messages(
-    messages: list[dict[str, Any]],
-    images: list[tuple[bytes, str]] | None = None,
-) -> list[dict[str, Any]]:
-    """Convert our message format to OpenAI API format, handling images."""
-    result = []
-    image_count = 0
-
-    for msg in messages:
-        role = msg["role"]
-        content = msg.get("content", "")
-        msg_images = msg.get("images")
-
-        if isinstance(content, list):
-            # Interleaved content parts
-            parts: list[dict[str, Any]] = []
-            for part in content:
-                if part["type"] == "text":
-                    parts.append({"type": "text", "text": part["text"]})
-                elif part["type"] == "image":
-                    image_count += 1
-                    b64 = base64.b64encode(part["data"]).decode("ascii")
-                    parts.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{part['mime']};base64,{b64}"},
-                    })
-            result.append({"role": role, "content": parts})
-        elif msg_images:
-            # Multimodal message: text + images
-            parts = [{"type": "text", "text": content}]
-            for img_data, media_type in msg_images:
-                image_count += 1
-                b64 = base64.b64encode(img_data).decode("ascii")
-                parts.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{media_type};base64,{b64}"},
-                    }
-                )
-            result.append({"role": role, "content": parts})
-        else:
-            result.append({"role": role, "content": content})
-
-    if image_count > 100:
-        log.warning("payload contains %d images; provider may reject", image_count)
-    return result
-
-
-def _build_anthropic_messages(
-    messages: list[dict[str, Any]],
-) -> tuple[str, list[dict[str, Any]]]:
-    """Convert our message format to Anthropic API format. Returns (system, messages)."""
-    system_text = ""
-    api_messages = []
-    image_count = 0
-
-    for msg in messages:
-        role = msg["role"]
-        content = msg.get("content", "")
-
-        if role == "system":
-            system_text = content
-            continue
-
-        if isinstance(content, list):
-            # Interleaved content parts
-            parts: list[dict[str, Any]] = []
-            for part in content:
-                if part["type"] == "text":
-                    parts.append({"type": "text", "text": part["text"]})
-                elif part["type"] == "image":
-                    image_count += 1
-                    b64 = base64.b64encode(part["data"]).decode("ascii")
-                    parts.append({
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": part["mime"], "data": b64},
-                    })
-            api_messages.append({"role": role, "content": parts})
-        else:
-            msg_images = msg.get("images")
-            if msg_images:
-                parts = []
-                for img_data, media_type in msg_images:
-                    image_count += 1
-                    b64 = base64.b64encode(img_data).decode("ascii")
-                    parts.append(
-                        {
-                            "type": "image",
-                            "source": {"type": "base64", "media_type": media_type, "data": b64},
-                        }
-                    )
-                parts.append({"type": "text", "text": content})
-                api_messages.append({"role": role, "content": parts})
-            else:
-                api_messages.append({"role": role, "content": content})
-
-    if image_count > 100:
-        log.warning("payload contains %d images; provider may reject", image_count)
-    return system_text, api_messages
 
 
 class LLM:
@@ -361,24 +75,24 @@ class LLM:
         base_url: str | None = None,
     ) -> None:
         self.provider = provider
-        self._model = model
+        self._model: str
         self._is_anthropic = provider in ("anthropic", "claude")
+        self._anthropic: Any = None
+        self._openai: Any = None
 
         if self._is_anthropic:
-            kwargs = {"api_key": api_key}
+            kwargs: dict[str, Any] = {"api_key": api_key}
             if base_url:
                 kwargs["base_url"] = base_url
             self._anthropic = anthropic.AsyncAnthropic(**kwargs)
-            self._model = model or _ANTHROPIC_DEFAULTS["model"]
+            self._model = model or ANTHROPIC_DEFAULTS["model"]
         else:
-            defaults = _OPENAI_COMPATIBLE_DEFAULTS.get(
-                provider, {"model": DEFAULT_MODEL_OPENAI},
-            )
+            defaults = OPENAI_COMPATIBLE_DEFAULTS.get(provider, OPENAI_FALLBACK_DEFAULTS)
             self._openai = openai.AsyncOpenAI(
                 api_key=api_key,
                 base_url=base_url or defaults.get("base_url", "https://api.openai.com/v1"),
             )
-            self._model = model or defaults.get("model", DEFAULT_MODEL_OPENAI)
+            self._model = model or str(defaults["model"])
             self._use_responses_api = defaults.get("api") == "responses"
 
     async def complete(
@@ -520,22 +234,22 @@ class LLM:
             try:
                 resp = await self._openai.responses.create(
                     model=use_model,
-                    input=_build_responses_input(messages),
+                    input=build_responses_input(messages),
                     max_output_tokens=max_tokens,
                     text={
                         "format": {
                             "type": "json_schema",
                             "name": "skill_output",
-                            "schema": _strict_json_schema(response_model),
+                            "schema": strict_json_schema(response_model),
                             "strict": True,
                         }
                     },
                 )
             except Exception as e:
-                if _is_context_overflow(e):
+                if is_context_overflow(e):
                     raise ContextOverflowError(str(e)) from e
                 raise
-            content = _extract_responses_text(resp)
+            content = extract_responses_text(resp)
             raw = LLMResponse(
                 content=content,
                 model=resp.model,
@@ -546,7 +260,7 @@ class LLM:
                 raw=resp,
             )
             try:
-                parsed = _parse_structured_text(content, response_model)
+                parsed = parse_structured_text(content, response_model)
             except (json.JSONDecodeError, ValidationError) as e:
                 # Some OpenAI-compatible servers ignore json_schema and return
                 # markdown / prose. Retry once with an explicit instruction.
@@ -555,9 +269,9 @@ class LLM:
                     e,
                 )
                 schema_hint = (
-                    f"\n\nSchema:\n{json.dumps(_strict_json_schema(response_model))}"
+                    f"\n\nSchema:\n{json.dumps(strict_json_schema(response_model))}"
                 )
-                retry_input = _build_responses_input(messages) + [
+                retry_input = build_responses_input(messages) + [
                     {"role": "assistant", "content": content or "(empty)"},
                     {
                         "role": "user",
@@ -578,16 +292,16 @@ class LLM:
                             "format": {
                                 "type": "json_schema",
                                 "name": "skill_output",
-                                "schema": _strict_json_schema(response_model),
+                                "schema": strict_json_schema(response_model),
                                 "strict": True,
                             }
                         },
                     )
                 except Exception as e2:
-                    if _is_context_overflow(e2):
+                    if is_context_overflow(e2):
                         raise ContextOverflowError(str(e2)) from e2
                     raise
-                content = _extract_responses_text(resp)
+                content = extract_responses_text(resp)
                 raw = LLMResponse(
                     content=content,
                     model=resp.model,
@@ -597,20 +311,20 @@ class LLM:
                     },
                     raw=resp,
                 )
-                parsed = _parse_structured_text(content, response_model)
+                parsed = parse_structured_text(content, response_model)
             return parsed, raw
         else:
             # OpenAI: native structured output
             try:
                 resp = await self._openai.beta.chat.completions.parse(
                     model=use_model,
-                    messages=_build_openai_messages(messages),
+                    messages=build_openai_messages(messages),
                     response_format=response_model,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
             except Exception as e:
-                if _is_context_overflow(e):
+                if is_context_overflow(e):
                     raise ContextOverflowError(str(e)) from e
                 raise
             choice = resp.choices[0]
@@ -640,7 +354,7 @@ class LLM:
     ) -> LLMResponse:
         kwargs: dict[str, Any] = {
             "model": model,
-            "messages": _build_openai_messages(messages),
+            "messages": build_openai_messages(messages),
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
@@ -650,7 +364,7 @@ class LLM:
         try:
             resp = await self._openai.chat.completions.create(**kwargs)
         except Exception as e:
-            if _is_context_overflow(e):
+            if is_context_overflow(e):
                 raise ContextOverflowError(str(e)) from e
             raise
 
@@ -677,14 +391,15 @@ class LLM:
         try:
             resp = await self._openai.responses.create(
                 model=model,
-                input=_build_responses_input(messages),
+                input=build_responses_input(messages),
                 max_output_tokens=max_tokens,
+                temperature=temperature,
             )
         except Exception as e:
-            if _is_context_overflow(e):
+            if is_context_overflow(e):
                 raise ContextOverflowError(str(e)) from e
             raise
-        content = _extract_responses_text(resp)
+        content = extract_responses_text(resp)
         return LLMResponse(
             content=content,
             model=resp.model,
@@ -704,7 +419,7 @@ class LLM:
         max_tokens: int,
         stream: bool = True,
     ) -> LLMResponse:
-        system_text, api_messages = _build_anthropic_messages(messages)
+        system_text, api_messages = build_anthropic_messages(messages)
 
         kwargs: dict[str, Any] = {
             "model": model,
@@ -729,15 +444,15 @@ class LLM:
                 try:
                     resp = await _send(kwargs)
                 except Exception as inner:
-                    if _is_context_overflow(inner):
+                    if is_context_overflow(inner):
                         raise ContextOverflowError(str(inner)) from inner
                     raise
-            elif _is_context_overflow(e):
+            elif is_context_overflow(e):
                 raise ContextOverflowError(str(e)) from e
             else:
                 raise
         except Exception as e:
-            if _is_context_overflow(e):
+            if is_context_overflow(e):
                 raise ContextOverflowError(str(e)) from e
             raise
 
@@ -797,73 +512,3 @@ class LLM:
         """
         async with self._anthropic.messages.stream(**kwargs) as stream:
             return await stream.get_final_message()
-
-
-def create_llm(
-    provider: str,
-    config: dict[str, Any],
-) -> LLM:
-    """Create an LLM instance from a provider name and config dict.
-
-    Config keys: api_key (required), model, base_url.
-    """
-    return LLM(
-        provider=provider,
-        api_key=config["api_key"],
-        model=config.get("model"),
-        base_url=config.get("base_url"),
-    )
-
-
-def create_llm_from_config(
-    llm_providers: dict[str, dict[str, Any]],
-    default_provider: str,
-    provider_override: str | None = None,
-) -> LLM:
-    """Create an LLM from the full app config.
-
-    Args:
-        llm_providers: Dict of provider_name -> config.
-        default_provider: Which provider to use by default.
-        provider_override: Optional override (e.g. from CLI --provider flag).
-    """
-    name = provider_override or default_provider
-    if name not in llm_providers:
-        available = ", ".join(llm_providers.keys()) or "(none configured)"
-        raise KeyError(f"LLM provider '{name}' not configured. Available: {available}")
-    return create_llm(name, llm_providers[name])
-
-
-def create_sync_client(
-    provider: str,
-    api_key: str,
-    *,
-    model: str | None = None,
-    base_url: str | None = None,
-) -> tuple[Any, str, bool]:
-    """Create a synchronous LLM client for use in executor backends.
-
-    Returns:
-        (client, resolved_model, is_openai) tuple.
-        - client: openai.OpenAI or anthropic.Anthropic instance
-        - resolved_model: model name with defaults applied
-        - is_openai: True if OpenAI-compatible, False if Anthropic
-    """
-    is_anthropic = provider in ("anthropic", "claude") or (
-        model and model.startswith("claude")
-    )
-
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url:
-        kwargs["base_url"] = base_url
-
-    if is_anthropic:
-        resolved = model or _ANTHROPIC_DEFAULTS["model"]
-        return anthropic.Anthropic(**kwargs), resolved, False
-
-    if not base_url:
-        defaults = _OPENAI_COMPATIBLE_DEFAULTS.get(provider, {})
-        kwargs["base_url"] = defaults.get("base_url", "https://api.openai.com/v1")
-    defaults = _OPENAI_COMPATIBLE_DEFAULTS.get(provider, {})
-    resolved = model or defaults.get("model", DEFAULT_MODEL_OPENAI)
-    return openai.OpenAI(**kwargs), resolved, True

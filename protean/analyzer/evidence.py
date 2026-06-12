@@ -29,7 +29,7 @@ TOKENS_PER_IMAGE = 1500               # conservative across Anthropic / OpenAI v
 HARD_IMAGE_CAP = 100                  # provider single-request limit + attention safety
 
 
-def _max_context() -> int:
+def max_context() -> int:
     raw = os.getenv("PROTEAN_MAX_CONTEXT")
     if not raw:
         return DEFAULT_MAX_CONTEXT
@@ -39,7 +39,7 @@ def _max_context() -> int:
         return DEFAULT_MAX_CONTEXT
 
 
-def _explicit_image_budget() -> int | None:
+def explicit_image_budget() -> int | None:
     """Explicit override that bypasses context-derivation AND HARD_IMAGE_CAP.
 
     Set ``PROTEAN_GENERATE_IMAGE_BUDGET`` only when you intentionally want to
@@ -54,7 +54,8 @@ def _explicit_image_budget() -> int | None:
         return None
 
 
-def _derive_image_budget(estimated_text_chars: int, max_context: int) -> int:
+def derive_image_budget(estimated_text_chars: int, max_context: int) -> int:
+    """Compute how many images fit given estimated text and context window."""
     text_tokens = int(estimated_text_chars * TOKENS_PER_CHAR)
     overhead = SYSTEM_TOKEN_RESERVE + RESPONSE_TOKEN_RESERVE
     available = max_context - overhead - text_tokens
@@ -311,15 +312,15 @@ class EvidencePack:
                 # account for "[overview_N]" + "[detail_N: ...]" labels
                 estimated_text_chars += 64
 
-        max_context = _max_context()
+        max_ctx = max_context()
         if not include_images:
             budget = 0
         else:
-            explicit = _explicit_image_budget()
+            explicit = explicit_image_budget()
             if explicit is not None:
                 budget = explicit
             else:
-                budget = _derive_image_budget(estimated_text_chars, max_context)
+                budget = derive_image_budget(estimated_text_chars, max_ctx)
 
         selected_overview, selected_detail = _select_frames_for_images(
             self.frame_pairs, self.utterances, budget

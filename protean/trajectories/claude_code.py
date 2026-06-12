@@ -6,7 +6,11 @@ import os
 from pathlib import Path
 from typing import Any
 
-from protean.trajectories.base import JsonlSessionAdapter, stringify_content
+from protean.trajectories.base import (
+    JsonlSessionAdapter,
+    extract_images,
+    stringify_content,
+)
 
 
 def _claude_home() -> Path:
@@ -144,13 +148,29 @@ class ClaudeCodeSessionAdapter(JsonlSessionAdapter):
                     if not call_id or call_id in seen_results:
                         continue
                     seen_results.add(call_id)
-                    react_events.append({
+                    tool_name = tool_names.get(call_id, "")
+                    from_protean = tool_name.startswith("mcp__protean__")
+                    inner_content = item.get("content")
+                    raw_images = extract_images(inner_content)
+                    event: dict[str, Any] = {
                         "type": "tool_result",
                         "call_id": call_id,
-                        "tool_name": tool_names.get(call_id, ""),
-                        "result": stringify_content(item.get("content")),
+                        "tool_name": tool_name,
+                        "result": stringify_content(inner_content),
                         "timestamp": timestamp,
-                    })
+                    }
+                    if raw_images:
+                        if from_protean:
+                            event["images"] = [
+                                (data, mime, "detail" if i == 1 else "overview")
+                                for i, (data, mime) in enumerate(raw_images)
+                            ]
+                        else:
+                            event["images"] = [
+                                (data, mime, "overview")
+                                for data, mime in raw_images
+                            ]
+                    react_events.append(event)
 
             if pending_text:
                 react_events.append({

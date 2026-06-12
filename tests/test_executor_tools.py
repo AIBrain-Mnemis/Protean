@@ -160,10 +160,7 @@ def test_computer_use_tool_error_includes_schema_hint():
         "for example {\"x\": 100, \"y\": 200}."
     )
 
-    assert result == [{
-        "type": "text",
-        "text": expected,
-    }]
+    assert result.text == expected
 
 
 def test_computer_use_reasoning_truncated_as_content_placeholder():

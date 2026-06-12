@@ -36,11 +36,17 @@ For each step, produce:
     - description: human-readable verification text — what the screen should look like after this step. Always fill this field regardless of strategy.
   Fill only the strategy-specific fields relevant to the chosen strategy, but always include description.
 
-- **figures**: list of figures to help agent find where to take actions.
+- **figures**: list of figures to help the agent recognize UI targets or visual states.
 
   Each figure ref is `overview_N` or `detail_N`, where N is the Frame number from the evidence timeline. Each frame header declares which images are available (e.g. `[action | overview + detail]` or `[scene | overview]`). Only reference images declared in the header.
 
-  Include a figure if multiple possible targets match the description, the target is identified only by location (e.g., "top-right icon"), or the target is an unlabeled icon or ambiguous UI element.
+  Include a figure only when the step would be hard to execute correctly from text alone, for example:
+    - an unlabeled/icon-only control where the visual shape matters;
+    - a target identified by visual location or relative layout rather than label (e.g. "the small calendar icon below Mail in the left rail");
+    - an ambiguous UI state that changes the next action (e.g. duplicate recipient pills that must be removed);
+    - a visual verification target whose appearance/location is the evidence of success (e.g. an event block at a time slot).
+
+  Do not use figures as a walkthrough gallery, progress log, or routine before/after screenshots. If a text label, AX role/title, keyboard shortcut, script output, terminal command, or clearly named field/button identifies the target unambiguously, leave figures empty for that step. Do not include figures merely to show that a normal labeled field was filled, a checkbox is on, a dropdown appeared, or a window opened.
 
   **Prefer detail shots when available. Use overview shots when broader context is needed or the frame has no detail.**
 

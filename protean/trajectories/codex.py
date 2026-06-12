@@ -7,11 +7,33 @@ import os
 from pathlib import Path
 from typing import Any
 
-from protean.trajectories.base import CallRecord, JsonlSessionAdapter
+from protean.trajectories.base import (
+    CallRecord,
+    JsonlSessionAdapter,
+    extract_images,
+    stringify_content,
+)
 
 
 def _codex_home() -> Path:
     return Path(os.getenv("CODEX_HOME", str(Path.home() / ".codex")))
+
+
+def _assign_image_roles(
+    raw: list[tuple[bytes, str]], from_protean_mcp: bool,
+) -> list[tuple[bytes, str, str]]:
+    """Assign overview/detail roles based on source.
+
+    Protean MCP result_to_mcp outputs: screenshot (overview) then
+    optional detail_crop (detail). Other sources: all overview.
+    """
+    if not from_protean_mcp:
+        return [(data, mime, "overview") for data, mime in raw]
+    result: list[tuple[bytes, str, str]] = []
+    for i, (data, mime) in enumerate(raw):
+        role = "detail" if i == 1 else "overview"
+        result.append((data, mime, role))
+    return result
 
 
 def _loads_args(raw: Any) -> dict[str, Any]:
@@ -113,7 +135,11 @@ class CodexSessionAdapter(JsonlSessionAdapter):
                     continue
                 record = calls.setdefault(call_id, CallRecord(call_id, timestamp))
                 if not record.result:
-                    record.result = str(payload.get("output") or "")
+                    output = payload.get("output")
+                    record.result = stringify_content(output)
+                    record.images = _assign_image_roles(
+                        extract_images(output), record.from_mcp,
+                    )
                     record.result_timestamp = timestamp
                 continue
 
@@ -127,9 +153,13 @@ class CodexSessionAdapter(JsonlSessionAdapter):
                 args = invocation.get("arguments")
                 if isinstance(args, dict):
                     record.tool_args = args
+                record.from_mcp = invocation.get("server") == "protean"
                 result = payload.get("result")
                 if result is not None:
-                    record.result = str(result)
+                    record.result = stringify_content(result)
+                    record.images = _assign_image_roles(
+                        extract_images(result), record.from_mcp,
+                    )
                     record.result_timestamp = timestamp
 
         combined: list[dict[str, Any]] = list(messages)
@@ -143,12 +173,15 @@ class CodexSessionAdapter(JsonlSessionAdapter):
                     "timestamp": record.timestamp,
                 })
             if record.result:
-                combined.append({
+                event: dict[str, Any] = {
                     "type": "tool_result",
                     "call_id": record.call_id,
                     "tool_name": record.tool_name,
                     "result": record.result,
                     "timestamp": record.result_timestamp or record.timestamp,
-                })
+                }
+                if record.images:
+                    event["images"] = record.images
+                combined.append(event)
 
         return sorted(combined, key=lambda item: item.get("timestamp", ""))

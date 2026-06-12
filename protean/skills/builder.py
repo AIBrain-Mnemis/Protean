@@ -21,6 +21,13 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field, ValidationError
 
+from protean.analyzer.evidence import (
+    derive_image_budget,
+    explicit_image_budget,
+    max_context,
+)
+from protean.llm import ContextOverflowError
+from protean.platform.base import prepare_screenshot_for_llm
 from protean.skills.prompts import (
     CREATE_FROM_TRAJECTORY_PROMPT,
     FINALIZE_PROMPT,
@@ -29,6 +36,7 @@ from protean.skills.prompts import (
     REFINE_PROMPT,
 )
 from protean.skills.schema import Skill, SkillParameter, Step, to_kebab
+from protean.skills.toolkit import get_toolkit_prompt
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +84,43 @@ def _ht(text: str, head: int, tail: int) -> str:
     if len(text) <= head + tail:
         return text
     return f"{text[:head]}…[{len(text) - head - tail} chars]…{text[-tail:]}"
+
+
+def _is_payload_too_large_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "413" in msg or "payload too large" in msg or "request payload" in msg
+
+
+def _figure_ref_key(ref: str) -> str:
+    raw = ref.strip().replace("\\", "/")
+    if raw.startswith("figs/"):
+        raw = raw.removeprefix("figs/")
+    return raw.lower().replace(" ", "_")
+
+
+def _resolve_referenced_figures(skill: Skill, available: dict[str, bytes]) -> None:
+    lookup: dict[str, tuple[str, bytes]] = {}
+    for ref, data in available.items():
+        key = _figure_ref_key(ref)
+        base = key[:-4] if key.endswith(".jpg") else key
+        filename = key if key.endswith(".jpg") else f"{key}.jpg"
+        lookup[key] = (filename, data)
+        lookup[base] = (filename, data)
+        lookup[filename] = (filename, data)
+
+    used: dict[str, bytes] = {}
+    for step in skill.steps:
+        resolved = []
+        for fig in step.figures:
+            hit = lookup.get(_figure_ref_key(fig.ref))
+            if hit is None:
+                continue
+            filename, data = hit
+            fig.ref = filename
+            resolved.append(fig)
+            used[filename] = data
+        step.figures = resolved
+    skill.figure_data = used
 
 
 # ── Action rendering + cost accounting ────────────────────
@@ -436,101 +481,156 @@ class SkillBuilder:
         enforces that all original steps are preserved.
         When existing_skill is None, creates a new skill from scratch.
         """
-        figure_data: dict[str, bytes] = {}
+        original_figure_data: dict[str, bytes] = {}
 
         if existing_skill is not None:
-            figure_data = dict(existing_skill.figure_data)
+            original_figure_data = dict(existing_skill.figure_data)
 
-        # Render trajectory as interleaved text + screenshots
-        traj_parts: list[dict] = []
+        # Collect all action images across the trajectory for budget-aware selection.
+        # Each entry: (step_index, frame_number, image_data, mime, role)
+        all_action_images: list[tuple[int, int, bytes, str, str]] = []
+        frame_number = 0
         for t in trajectory.steps:
-            passed_str = "PASSED" if t.verify_passed else "FAILED"
-            action_lines = render_action_transcript(t.actions)
-            text = (
-                f"## Step {t.step_index + 1}: \"{t.step_name}\"\n"
-                f"Instruction sent:\n{t.instruction}\n"
-                f"Executor actions:\n{action_lines}\n"
-                f"Executor final response:\n"
-                f"{t.executor_response or '(no response)'}\n"
-                f"Verification: {t.verify_strategy} → {passed_str}\n"
-                f"Reason: {t.verify_reason}\n"
-                f"Attempts: {t.attempts}"
-                + ("\nResolved by assistant: yes" if t.resolved_by_assistant else "")
-            )
-            traj_parts.append({"type": "text", "text": text})
-            tool_call_count = sum(1 for a in t.actions if a.event_type == "tool_call")
-            struggled = tool_call_count > 5
-            include_screenshot = (
-                t.screenshot
-                and (
-                    not t.verify_passed
-                    or t.resolved_by_assistant
-                    or t.attempts > 1
-                    or struggled
-                )
-            )
-            if include_screenshot and t.screenshot:
-                from protean.platform.base import prepare_screenshot_for_llm
+            for a in t.actions:
+                if a.event_type == "tool_result" and a.images:
+                    for img_data, mime, role in a.images:
+                        if role == "detail":
+                            frame_no = frame_number
+                        else:
+                            frame_number += 1
+                            frame_no = frame_number
+                        if frame_no > 0:
+                            all_action_images.append((t.step_index, frame_no, img_data, mime, role))
 
-                img_bytes, img_mime = prepare_screenshot_for_llm(t.screenshot)
-                ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-                traj_ref = f"traj_{t.step_name}_{ts}.jpg"
-                figure_data[traj_ref] = img_bytes
-                caption = (
-                    f"[{traj_ref}] screenshot after step {t.step_index + 1} "
-                    f"\"{t.step_name}\" — {passed_str}\n"
-                )
-                traj_parts.append({"type": "text", "text": caption})
-                traj_parts.append({
-                    "type": "image",
-                    "data": img_bytes,
-                    "mime": img_mime,
-                })
-
-        available_refs = sorted(figure_data.keys())
-        if available_refs:
-            prompt += (
-                "\n\n## Available figure refs\n"
-                "Only use these refs in step figures. "
-                "Do NOT invent new refs.\n"
-                + "\n".join(f"- {ref}" for ref in available_refs)
-                + "\n"
-            )
+        # Derive image budget and select within it.
+        estimated_text_chars = sum(
+            len(render_action_transcript(t.actions)) + 200
+            for t in trajectory.steps
+        )
+        explicit = explicit_image_budget()
+        if explicit is not None:
+            img_budget = explicit
+        else:
+            img_budget = derive_image_budget(estimated_text_chars, max_context())
 
         hotspot_hint = render_output_hotspot_hint(
             _measure_action_costs(trajectory),
         )
-        if hotspot_hint:
-            prompt += "\n\n" + hotspot_hint
 
-        # Build multimodal content
-        content_parts: list[dict] = [{"type": "text", "text": prompt}]
+        def _select_image_indices(image_budget: int) -> set[int]:
+            if image_budget <= 0 or not all_action_images:
+                return set()
+            if len(all_action_images) <= image_budget:
+                return set(range(len(all_action_images)))
+            n = len(all_action_images)
+            selected = {0, n - 1}
+            if image_budget > 2:
+                step = (n - 1) / (image_budget - 1)
+                for i in range(1, image_budget - 1):
+                    selected.add(round(i * step))
+            return selected
 
-        original_figures = {
-            k: v for k, v in figure_data.items()
-            if not k.startswith("traj_")
-        }
-        if original_figures:
-            content_parts.append({
-                "type": "text",
-                "text": "## Original skill reference images\n",
-            })
-            for filename, img_bytes in original_figures.items():
+        def _display_ref(filename: str) -> str:
+            return filename[:-4] if filename.endswith(".jpg") else filename
+
+        def _build_messages(image_budget: int) -> tuple[list[dict], dict[str, bytes], int]:
+            selected_indices = _select_image_indices(image_budget)
+            figure_data = dict(original_figure_data)
+
+            step_images: dict[int, list[tuple[int, bytes, str, str]]] = {}
+            for idx, (step_idx, frame_no, img_data, mime, role) in enumerate(all_action_images):
+                if idx in selected_indices:
+                    step_images.setdefault(step_idx, []).append((frame_no, img_data, mime, role))
+
+            traj_parts: list[dict] = []
+            for t in trajectory.steps:
+                passed_str = "PASSED" if t.verify_passed else "FAILED"
+                action_lines = render_action_transcript(t.actions)
+                text = (
+                    f"## Step {t.step_index + 1}: \"{t.step_name}\"\n"
+                    f"Instruction sent:\n{t.instruction}\n"
+                    f"Executor actions:\n{action_lines}\n"
+                    f"Executor final response:\n"
+                    f"{t.executor_response or '(no response)'}\n"
+                    f"Verification: {t.verify_strategy} → {passed_str}\n"
+                    f"Reason: {t.verify_reason}\n"
+                    f"Attempts: {t.attempts}"
+                    + ("\nResolved by assistant: yes" if t.resolved_by_assistant else "")
+                )
+                traj_parts.append({"type": "text", "text": text})
+
+                for frame_no, img_data, mime, role in step_images.get(t.step_index, []):
+                    ref = f"{role}_{frame_no}"
+                    filename = f"{ref}.jpg"
+                    figure_data[filename] = img_data
+                    traj_parts.append({"type": "text", "text": f"[{ref}]\n"})
+                    traj_parts.append({"type": "image", "data": img_data, "mime": mime})
+
+                tool_call_count = sum(1 for a in t.actions if a.event_type == "tool_call")
+                struggled = tool_call_count > 5
+                include_screenshot = (
+                    t.screenshot
+                    and (
+                        not t.verify_passed
+                        or t.resolved_by_assistant
+                        or t.attempts > 1
+                        or struggled
+                    )
+                )
+                if include_screenshot and t.screenshot:
+                    img_bytes, img_mime = prepare_screenshot_for_llm(t.screenshot)
+                    ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+                    traj_ref = f"traj_{t.step_name}_{ts}.jpg"
+                    figure_data[traj_ref] = img_bytes
+                    caption = (
+                        f"[{traj_ref}] screenshot after step {t.step_index + 1} "
+                        f"\"{t.step_name}\" — {passed_str}\n"
+                    )
+                    traj_parts.append({"type": "text", "text": caption})
+                    traj_parts.append({
+                        "type": "image",
+                        "data": img_bytes,
+                        "mime": img_mime,
+                    })
+
+            prompt_text = prompt
+            available_refs = sorted(_display_ref(ref) for ref in figure_data)
+            if available_refs:
+                prompt_text += (
+                    "\n\n## Available figure refs\n"
+                    "Only use these refs in step figures. "
+                    "Do NOT invent new refs.\n"
+                    + "\n".join(f"- {ref}" for ref in available_refs)
+                    + "\n"
+                )
+            if hotspot_hint:
+                prompt_text += "\n\n" + hotspot_hint
+
+            content_parts: list[dict] = [{"type": "text", "text": prompt_text}]
+
+            if original_figure_data:
                 content_parts.append({
-                    "type": "text", "text": f"[{filename}]\n",
+                    "type": "text",
+                    "text": "## Original skill reference images\n",
                 })
-                content_parts.append({
-                    "type": "image",
-                    "data": img_bytes,
-                    "mime": "image/jpeg",
-                })
+                for filename, img_bytes in original_figure_data.items():
+                    content_parts.append({
+                        "type": "text", "text": f"[{_display_ref(filename)}]\n",
+                    })
+                    content_parts.append({
+                        "type": "image",
+                        "data": img_bytes,
+                        "mime": "image/jpeg",
+                    })
 
-        if traj_parts:
-            content_parts.extend(traj_parts)
-        else:
-            content_parts.append({"type": "text", "text": "(no steps executed)"})
+            if traj_parts:
+                content_parts.extend(traj_parts)
+            else:
+                content_parts.append({"type": "text", "text": "(no steps executed)"})
 
-        messages: list[dict] = [{"role": "user", "content": content_parts}]
+            return [{"role": "user", "content": content_parts}], figure_data, len(selected_indices)
+
+        messages, figure_data, selected_image_count = _build_messages(img_budget)
 
         result_skill: Skill | None = None
         max_attempts = 3
@@ -542,12 +642,27 @@ class SkillBuilder:
                     model=model,
                     temperature=temperature,
                 )
-            except (ValidationError, Exception) as e:
+            except (ValidationError, ContextOverflowError, Exception) as e:
                 log.warning(
                     "_generate_from_trajectory: structured output failed "
                     "(attempt %d/%d): %s",
                     attempt + 1, max_attempts, e,
                 )
+                if (
+                    isinstance(e, ContextOverflowError) or _is_payload_too_large_error(e)
+                ) and attempt < max_attempts - 1:
+                    if selected_image_count > 0:
+                        img_budget = max(0, selected_image_count // 2)
+                    else:
+                        img_budget = 0
+                    if attempt == max_attempts - 2:
+                        img_budget = 0
+                    messages, figure_data, selected_image_count = _build_messages(img_budget)
+                    log.warning(
+                        "_generate_from_trajectory: retrying with image budget=%d "
+                        "(%d images selected)",
+                        img_budget, selected_image_count,
+                    )
                 continue
 
             # Refine mode: all original steps must be preserved
@@ -656,19 +771,7 @@ class SkillBuilder:
             result_skill.source = "trajectory"
             result_skill.normalize_name()
 
-        # Filter out invalid figure refs
-        figure_keys = set(figure_data.keys())
-        figure_keys_no_ext = {k.rsplit(".", 1)[0] for k in figure_keys}
-        for step in result_skill.steps:
-            resolved_figures = []
-            for fig in step.figures:
-                ref = fig.ref
-                if ref in figure_keys:
-                    resolved_figures.append(fig)
-                elif ref in figure_keys_no_ext:
-                    fig.ref = ref + ".jpg"
-                    resolved_figures.append(fig)
-            step.figures = resolved_figures
+        _resolve_referenced_figures(result_skill, figure_data)
 
         return result_skill
 
@@ -766,9 +869,6 @@ class SkillBuilder:
     ) -> Skill:
         """Generate a Skill from an EvidencePack (recording analysis)."""
         import os
-
-        from protean.llm import ContextOverflowError
-        from protean.skills.toolkit import get_toolkit_prompt
 
         # Helper: count images in the user content_parts so the next-attempt
         # budget can be derived from the actual number sent (not the configured
@@ -874,24 +974,13 @@ class SkillBuilder:
                 "llm_usage": response.usage,
             }
 
-        # Map LLM figure references (overview_N / detail_N) to filenames + bytes.
-        # All frames are addressable — numbering matches format_for_llm.
         if include_images and evidence.frame_pairs:
             frame_map: dict[str, bytes] = {}
             for frame_num, pair in enumerate(evidence.frame_pairs, 1):
                 frame_map[f"overview_{frame_num}"] = pair.overview_bytes
                 if pair.detail_bytes:
                     frame_map[f"detail_{frame_num}"] = pair.detail_bytes
-            for step in skill.steps:
-                resolved = []
-                for fig in step.figures:
-                    ref_norm = fig.ref.strip().lower().replace(" ", "_")
-                    if ref_norm in frame_map:
-                        filename = f"{ref_norm}.jpg"
-                        skill.figure_data[filename] = frame_map[ref_norm]
-                        fig.ref = filename
-                        resolved.append(fig)
-                step.figures = resolved
+            _resolve_referenced_figures(skill, frame_map)
 
         return skill
 

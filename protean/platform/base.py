@@ -446,7 +446,7 @@ def active_display_index(platform: Platform) -> int:
 
 @dataclass(frozen=True)
 class DisplayScale:
-    """Maps a fixed API coordinate space onto an actual display.
+    """Maps an API coordinate space onto an actual display.
 
     Executors show the model a screenshot resized to ``(api_w, api_h)`` and
     receive click coords in that same space. We then need to translate those
@@ -480,6 +480,9 @@ class CoordinateMapper:
     follows the user moving windows between monitors. ``to_actual()`` then
     translates a coord from API space (the screenshot the model sees) to
     a real screen pixel on the same display.
+
+    The API width is fixed and the API height follows the active display's
+    aspect ratio, so screenshots keep the same geometry the user sees.
     """
 
     def __init__(self, platform: Platform, api_w: int, api_h: int) -> None:
@@ -505,9 +508,10 @@ class CoordinateMapper:
             self._scale = DisplayScale(self._api_w, self._api_h, self._api_w, self._api_h)
             self._display_index = 1
             return None
+        api_h = int(round(self._api_w * d.height / d.width))
         self._scale = DisplayScale(
             api_w=self._api_w,
-            api_h=self._api_h,
+            api_h=api_h,
             actual_w=d.width,
             actual_h=d.height,
             origin_x=d.origin_x,

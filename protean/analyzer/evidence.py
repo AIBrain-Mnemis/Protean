@@ -19,49 +19,13 @@ from pathlib import Path
 
 from protean.analyzer.compaction import CompactedEvent, compact_events
 from protean.analyzer.frames import FramePair, extract_frame_pair
+from protean.llm.context import (
+    TOKENS_PER_CHAR,
+    derive_image_budget,
+    explicit_image_budget,
+    max_context,
+)
 from protean.recorder.audio import transcribe
-
-DEFAULT_MAX_CONTEXT = 200_000        # tokens — Anthropic Sonnet/Opus default
-RESPONSE_TOKEN_RESERVE = 16_000       # leave room for the structured Skill output
-SYSTEM_TOKEN_RESERVE = 8_000          # RECORDING_SYSTEM_PROMPT + toolkit prompt (~7.3k tok)
-TOKENS_PER_CHAR = 1 / 3               # CJK-conservative (Chinese ≈ 1 tok/char, ASCII ≈ 0.25)
-TOKENS_PER_IMAGE = 1500               # conservative across Anthropic / OpenAI vision
-HARD_IMAGE_CAP = 100                  # provider single-request limit + attention safety
-
-
-def max_context() -> int:
-    raw = os.getenv("PROTEAN_MAX_CONTEXT")
-    if not raw:
-        return DEFAULT_MAX_CONTEXT
-    try:
-        return max(20_000, int(raw))
-    except ValueError:
-        return DEFAULT_MAX_CONTEXT
-
-
-def explicit_image_budget() -> int | None:
-    """Explicit override that bypasses context-derivation AND HARD_IMAGE_CAP.
-
-    Set ``PROTEAN_GENERATE_IMAGE_BUDGET`` only when you intentionally want to
-    take control of image count (e.g. for Gemini 1M with a known-safe value).
-    """
-    raw = os.getenv("PROTEAN_GENERATE_IMAGE_BUDGET")
-    if not raw:
-        return None
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return None
-
-
-def derive_image_budget(estimated_text_chars: int, max_context: int) -> int:
-    """Compute how many images fit given estimated text and context window."""
-    text_tokens = int(estimated_text_chars * TOKENS_PER_CHAR)
-    overhead = SYSTEM_TOKEN_RESERVE + RESPONSE_TOKEN_RESERVE
-    available = max_context - overhead - text_tokens
-    if available <= 0:
-        return 0
-    return min(HARD_IMAGE_CAP, available // TOKENS_PER_IMAGE)
 
 
 def _probe_video_duration(video_path: Path) -> float | None:

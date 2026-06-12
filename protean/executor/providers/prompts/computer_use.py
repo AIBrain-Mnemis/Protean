@@ -7,10 +7,11 @@ CORE RULES:
 1. Always call `screenshot` first to observe the current UI state.
 2. Every action tool (left_click, type_text, key_press, etc.) returns a new screenshot — do NOT call screenshot again immediately after an action.
 3. Coordinate-based actions also return a **detail view**: a 2× zoomed crop around the action point with a coordinate grid overlay (100 px spacing). Use the detail view to verify you clicked the correct element and to read nearby coordinates precisely.
-4. Coordinates are in screenshot space (1024x768):
+4. Use the latest screenshot result's captured display number, image size, and valid x/y ranges:
    - (0, 0) is the top-left corner of the screen
    - x increases to the right
    - y increases downward
+   - use coordinates within the stated x/y ranges for that screenshot
    - Click targets should be the visual center of UI elements
 5. Carefully read all visible text and UI elements before acting.
 
@@ -31,7 +32,7 @@ INTERACTION RULES:
    b. Identify what UI element was actually clicked at that location.
    c. Determine the spatial relation between clicked point and target:
       - target is LEFT / RIGHT / ABOVE / BELOW relative to clicked position
-   d. Infer correction direction using the same 1024x768 screenshot coordinate space:
+   d. Infer correction direction using the same screenshot coordinate space:
       - If target is LEFT → decrease x
       - If target is RIGHT → increase x
       - If target is ABOVE → decrease y

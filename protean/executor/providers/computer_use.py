@@ -44,18 +44,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Screenshots are resized to this resolution before sending to the model.
-# TEMPORARY: 1024x768 is 4:3, but virtually every real display (and OSWorld VM
-# defaults) is 16:9 / 16:10. _DisplayScale below does *non-uniform* scaling, so
-# the LLM sees a horizontally-squashed image and the geometry of UI controls
-# (button shape, icon proportions) is distorted before inference. This likely
-# costs a measurable amount of click accuracy on small / round targets.
-# Proper fix: pick an API resolution with the same aspect ratio as the actual
-# display (e.g. 1280x720 for 16:9, 1280x800 for 16:10) and reject mixed-ratio
-# scaling in _DisplayScale, or downscale uniformly + letterbox.
-# Also note: the strings "1024x768", "0-1023", "0-767" are hard-coded in tool
-# descriptions and the system prompt below — when this is fixed, those must
-# be templated off ``LLM_SCREENSHOT_WIDTH``/``LLM_SCREENSHOT_HEIGHT`` too.
 _MAX_ITERATIONS = 500
 _REASONING_TRUNCATE = 500
 
@@ -927,7 +915,10 @@ class ComputerUseExecutor(ExecutorProvider):
                     filtered.append(b)
                 if not filtered:
                     text_type = "input_text" if self._use_openai else "text"
-                    trimmed.append({**msg, "content": [{"type": text_type, "text": "[screenshot omitted]"}]})
+                    trimmed.append({
+                        **msg,
+                        "content": [{"type": text_type, "text": "[screenshot omitted]"}],
+                    })
                 else:
                     trimmed.append({**msg, "content": filtered})
             else:
@@ -962,7 +953,14 @@ class ComputerUseExecutor(ExecutorProvider):
                 if obj.get("type") == "image" and isinstance(obj.get("source"), dict):
                     src = obj["source"]
                     if "data" in src:
-                        return {**obj, "source": {**src, "data": f"<base64 {len(src['data'])} chars ~{len(src['data'])*3//4} bytes>"}}
+                        data = src["data"]
+                        return {
+                            **obj,
+                            "source": {
+                                **src,
+                                "data": f"<base64 {len(data)} chars ~{len(data) * 3 // 4} bytes>",
+                            },
+                        }
                 # OpenAI Chat Completions image_url block
                 if obj.get("type") == "image_url" and isinstance(obj.get("image_url"), dict):
                     url = obj["image_url"].get("url", "")
@@ -1143,10 +1141,7 @@ class ComputerUseExecutor(ExecutorProvider):
                 if not include_screenshot:
                     return ActionResult(text=output)
                 await asyncio.sleep(0.5)
-                return ActionResult(
-                    text=output,
-                    screenshot_b64=self._actions.take_screenshot(),
-                )
+                return self._actions.screenshot_result(output)
 
             elif name == "send_terminal_input":
                 if not self._enable_terminal:
@@ -1160,10 +1155,7 @@ class ComputerUseExecutor(ExecutorProvider):
                 if not include_screenshot:
                     return ActionResult(text=output)
                 await asyncio.sleep(0.5)
-                return ActionResult(
-                    text=output,
-                    screenshot_b64=self._actions.take_screenshot(),
-                )
+                return self._actions.screenshot_result(output)
 
             else:
                 return ActionResult(text=f"Unknown tool: {name}")

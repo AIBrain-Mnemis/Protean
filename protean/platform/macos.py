@@ -1322,6 +1322,36 @@ class MacOSPlatform(Platform):
             height=int(h),
         )
 
+    def element_focused(self) -> ElementInfo | None:
+        system = AXUIElementCreateSystemWide()
+        err, el = AXUIElementCopyAttributeValue(system, "AXFocusedUIElement", None)
+        if err != 0 or el is None:
+            return None
+
+        label = ""
+        for attr in ("AXTitle", "AXDescription", "AXValue"):
+            _, val = AXUIElementCopyAttributeValue(el, attr, None)
+            if val and str(val).strip():
+                label = str(val)
+                break
+
+        _, role = AXUIElementCopyAttributeValue(el, "AXRole", None)
+        _, pos_val = AXUIElementCopyAttributeValue(el, "AXPosition", None)
+        _, size_val = AXUIElementCopyAttributeValue(el, "AXSize", None)
+        pos_x, pos_y = _extract_ax_point(pos_val)
+        width, height = _extract_ax_size(size_val)
+        if pos_x is None or pos_y is None or width is None or height is None:
+            return None
+
+        return ElementInfo(
+            role=str(role) if role else "",
+            label=label,
+            center_x=int(pos_x + width / 2),
+            center_y=int(pos_y + height / 2),
+            width=int(width),
+            height=int(height),
+        )
+
     def find_elements(self, app: str, query: str) -> list:
         """Fuzzy-search UI elements by text — returns list of ElementInfo.
 

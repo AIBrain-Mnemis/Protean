@@ -21,12 +21,8 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field, ValidationError
 
-from protean.analyzer.evidence import (
-    derive_image_budget,
-    explicit_image_budget,
-    max_context,
-)
 from protean.llm import ContextOverflowError
+from protean.llm.context import derive_image_budget, explicit_image_budget, max_context
 from protean.platform.base import prepare_screenshot_for_llm
 from protean.skills.prompts import (
     CREATE_FROM_TRAJECTORY_PROMPT,
@@ -84,11 +80,6 @@ def _ht(text: str, head: int, tail: int) -> str:
     if len(text) <= head + tail:
         return text
     return f"{text[:head]}…[{len(text) - head - tail} chars]…{text[-tail:]}"
-
-
-def _is_payload_too_large_error(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    return "413" in msg or "payload too large" in msg or "request payload" in msg
 
 
 def _figure_ref_key(ref: str) -> str:
@@ -634,6 +625,7 @@ class SkillBuilder:
 
         result_skill: Skill | None = None
         max_attempts = 3
+        last_validation_error: ValidationError | None = None
         for attempt in range(max_attempts):
             try:
                 output, _ = await llm.complete_structured(
@@ -642,27 +634,34 @@ class SkillBuilder:
                     model=model,
                     temperature=temperature,
                 )
-            except (ValidationError, ContextOverflowError, Exception) as e:
+            except ContextOverflowError as e:
                 log.warning(
                     "_generate_from_trajectory: structured output failed "
                     "(attempt %d/%d): %s",
                     attempt + 1, max_attempts, e,
                 )
-                if (
-                    isinstance(e, ContextOverflowError) or _is_payload_too_large_error(e)
-                ) and attempt < max_attempts - 1:
-                    if selected_image_count > 0:
-                        img_budget = max(0, selected_image_count // 2)
-                    else:
-                        img_budget = 0
-                    if attempt == max_attempts - 2:
-                        img_budget = 0
-                    messages, figure_data, selected_image_count = _build_messages(img_budget)
-                    log.warning(
-                        "_generate_from_trajectory: retrying with image budget=%d "
-                        "(%d images selected)",
-                        img_budget, selected_image_count,
-                    )
+                if attempt >= max_attempts - 1:
+                    raise
+                if selected_image_count > 0:
+                    img_budget = max(0, selected_image_count // 2)
+                else:
+                    img_budget = 0
+                if attempt == max_attempts - 2:
+                    img_budget = 0
+                messages, figure_data, selected_image_count = _build_messages(img_budget)
+                log.warning(
+                    "_generate_from_trajectory: retrying with image budget=%d "
+                    "(%d images selected)",
+                    img_budget, selected_image_count,
+                )
+                continue
+            except ValidationError as e:
+                last_validation_error = e
+                log.warning(
+                    "_generate_from_trajectory: structured output validation failed "
+                    "(attempt %d/%d): %s",
+                    attempt + 1, max_attempts, e,
+                )
                 continue
 
             # Refine mode: all original steps must be preserved
@@ -749,7 +748,9 @@ class SkillBuilder:
                     "returning original skill",
                 )
                 return existing_skill
-            raise RuntimeError("Failed to generate skill from trajectory after all attempts")
+            raise RuntimeError(
+                "Failed to generate skill from trajectory after all attempts"
+            ) from last_validation_error
 
         # Preserve immutable fields from existing skill
         if existing_skill is not None:

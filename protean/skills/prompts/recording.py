@@ -1,5 +1,6 @@
 """System prompt for the offline recording → skill pipeline."""
 
+from protean.skills.prompts.skill_authoring_rules import SKILL_AUTHORING_RULES
 from protean.skills.prompts.step_field_rules import STEP_FIELD_RULES
 
 RECORDING_SYSTEM_PROMPT = """\
@@ -82,7 +83,7 @@ When you generate a script, you MUST also wire it into the relevant step's `tool
 - **parameters**: values that may vary between invocations. Mark as **required** only when the recording shows no way to obtain the value (typed from memory). Mark as **optional** when the recording demonstrates how to retrieve it — the retrieval steps serve as the default fallback. Include constraints when relevant (e.g. 'valid room name', 'ISO date').
 - **tags**: 2-5 relevant tags.
 
-""" + STEP_FIELD_RULES + """\
+""" + SKILL_AUTHORING_RULES + STEP_FIELD_RULES + """\
 ## Important
 
 - DO NOT include pixel coordinates. Use element labels/names.

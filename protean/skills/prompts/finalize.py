@@ -1,5 +1,6 @@
 """Prompt for finalizing a skill from a sequence of demonstration steps."""
 
+from protean.skills.prompts.skill_authoring_rules import SKILL_AUTHORING_RULES
 from protean.skills.prompts.step_field_rules import STEP_FIELD_RULES
 
 FINALIZE_PROMPT = """\
@@ -28,7 +29,7 @@ Requirements:
 - Keep only stable product/UI labels literal. Variable business values such as
     titles, names, rooms, dates, times, and search text should usually become parameters.
 
-""" + STEP_FIELD_RULES + """
+""" + SKILL_AUTHORING_RULES + STEP_FIELD_RULES + """
 Here are the steps:
 
 """

@@ -1,5 +1,6 @@
 """Prompt for refining an existing skill against an execution trajectory."""
 
+from protean.skills.prompts.skill_authoring_rules import SKILL_AUTHORING_RULES
 from protean.skills.prompts.step_field_rules import STEP_FIELD_RULES
 
 REFINE_PROMPT = """\
@@ -15,6 +16,8 @@ A skill starts as a rough sketch from one demonstration. The executor (an AI age
 - **Precision vs generalizability**: The trajectory is ONE execution on ONE machine. Add details that help the executor find the right element, but keep the skill general (see Generalizability rules in Step fields below). The refined skill must work for ALL future runs.
 - **Do not pollute with concrete instances.** Specific people, rooms, file paths, dates, organization names, and project ids from THIS trajectory must not creep into the skill's ``description``, ``goal``, ``when_to_use``, step actions, or ``success_criteria``. If the original skill is already polluted with such instances, treat removing them as part of this refine.
 - **Bound growth.** Before adding new content to a refine, scan existing sections for compression first: tighten run-on prose in `description`, `goal`, and `verify_condition.description`; fold conditions duplicated across `when_to_use` and `success_criteria`; drop dead clauses. Never drop a `when_to_use` trigger, `success_criteria` bullet, or step `action` detail just to make room.
+- **Tighten cost-heavy successful paths.** When a successful trajectory spends substantial context or tool calls on long skill text, broad helper output, helper help/source inspection, ad hoc probes, or repeated broad validation, refine the skill into a compact fast path with trigger-based escalation. Keep checks that prove the final artifact, stated requirements, target selection, edit scope, and domain-critical values such as formulas, caches, units, directions, ordering, or immutability. Move rare-risk checks behind explicit triggers, such as archived/live ambiguity, same-sheet immutability risk, failed compact verification, missing metadata, or helper syntax uncertainty.
+- **Operationalize causal evidence.** Evolution guidance may include factual evidence of why the trajectory succeeded or failed. When an evidence item identifies a reusable decision rule, inference strategy, recovery pattern, or validation gap, encode that causal pattern as an executable step action, branch, tool hint, verify condition, or success criterion. Preserve the general rule behind the evidence while removing incidental task-specific names and values.
 
 ## What to look for in the trajectory
 
@@ -48,7 +51,7 @@ If a step has many executor actions (tool calls), the executor was struggling in
 ### 8. Replace fragile GUI sequences with commands when reliable
 If a step is a long or fragile GUI chain (many clicks, brittle find_elements queries, or repeated retries) AND the same end state can be produced by a verified shell command, script, or keyboard shortcut, rewrite the step to use that more direct route via run_terminal_command / run_script / key_press. Examples: a manual find-and-replace dance becomes `sed -i ...`; clicking through Finder/Explorer to create folders becomes `mkdir -p`; a Git GUI commit becomes `git commit -am ...`. Only substitute when you are confident the command achieves the same observable result on the target platform — otherwise keep the GUI path and just tighten it.
 
-""" + STEP_FIELD_RULES + """
+""" + SKILL_AUTHORING_RULES + STEP_FIELD_RULES + """
 ## Current skill
 
 {skill_steps}

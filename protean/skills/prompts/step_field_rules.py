@@ -1,4 +1,4 @@
-"""Shared `## Step fields` rules embedded into every skill-authoring prompt."""
+"""Shared `## Step fields` rules embedded into skill-writing prompts."""
 
 STEP_FIELD_RULES = """\
 ## Step fields
@@ -35,6 +35,7 @@ For each step, produce:
     - expected_text: the text that should appear on screen (for text_content)
     - description: human-readable verification text — what the screen should look like after this step. Always fill this field regardless of strategy.
   Fill only the strategy-specific fields relevant to the chosen strategy, but always include description.
+  The verify_condition proves local progress for this step; final end-state acceptance belongs in `success_criteria`.
 
 - **figures**: list of figures to help the agent recognize UI targets or visual states.
 

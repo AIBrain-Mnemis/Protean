@@ -40,6 +40,8 @@ Failures can reveal:
 - verification techniques,
 - or corrective patterns.
 
+Successful trajectories can reveal avoidable execution cost when the agent still had to read long skill text, dump broad helper output, inspect helper source or help repeatedly, write ad hoc probes, or run redundant checks before the working path was clear. Treat this as a refinement signal only when the trajectory gives concrete evidence of material cost and the reusable update can preserve correctness-critical validation.
+
 For each action, decide exactly one of:
 
 Each action is a learning contract, not a draft skill. Fill these fields:
@@ -50,6 +52,8 @@ Each action is a learning contract, not a draft skill. Fill these fields:
 - observed_gap: the missing, incorrect, redundant, or underspecified capability in the current library.
 - evidence: 3-8 short factual observations from the trajectory. Evidence must point to user messages, tool calls, tool results, errors, corrections, recovery steps, or verification outcomes.
 
+Promote causal lessons into the action contract. If the trajectory succeeded or failed because of a non-obvious decision rule, validation rule, recovery pattern, or inference strategy, name that reusable mechanism in `intent` or `observed_gap`. Use `evidence` only as factual support for the mechanism. For refine actions, `intent` must state the executable behavior the builder should add, including any causal decision rule that made the trajectory work or fail. When a trajectory contains both a surface workflow and the decision rule that made it correct, include both in the focused update.
+
 ### refine (preferred default)
 
 Use whenever an existing skill already overlaps with the capability revealed by the trajectory, even if the overlap is partial. Refining is cheap and almost always the right move when the learning fits an existing skill's scope.
@@ -59,6 +63,7 @@ Refine when:
 - the strategy was incomplete,
 - the validation / verification logic was insufficient,
 - the trajectory reveals a better generalized version of the skill,
+- a successful trajectory exposes a shorter fast path, compact helper output, trigger-based validation, or removal of redundant prose/tool probes,
 - or a locale / permission / UI / timing trap was newly discovered.
 
 Prefer refining a broader skill (and expanding its scope slightly) over creating a narrower specialized one.

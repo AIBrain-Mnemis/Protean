@@ -18,7 +18,6 @@ A skill starts as a rough sketch from one demonstration. The executor (an AI age
 - **Bound growth.** Before adding new content to a refine, scan existing sections for compression first: tighten run-on prose in `description`, `goal`, and `verify_condition.description`; fold conditions duplicated across `when_to_use` and `success_criteria`; drop dead clauses. Never drop a `when_to_use` trigger, `success_criteria` bullet, or step `action` detail just to make room.
 - **Tighten cost-heavy successful paths.** When a successful trajectory spends substantial context or tool calls on long skill text, broad helper output, helper help/source inspection, ad hoc probes, or repeated broad validation, refine the skill into a compact fast path with trigger-based escalation. Keep checks that prove the final artifact, stated requirements, target selection, edit scope, and domain-critical values such as formulas, caches, units, directions, ordering, or immutability. Move rare-risk checks behind explicit triggers, such as archived/live ambiguity, same-sheet immutability risk, failed compact verification, missing metadata, or helper syntax uncertainty.
 - **Operationalize causal evidence.** Evolution guidance may include factual evidence of why the trajectory succeeded or failed. When an evidence item identifies a reusable decision rule, inference strategy, recovery pattern, or validation gap, encode that causal pattern as an executable step action, branch, tool hint, verify condition, or success criterion. Preserve the general rule behind the evidence while removing incidental task-specific names and values.
-
 ## What to look for in the trajectory
 
 The executor's actions reveal what the skill description was missing. For each step:
@@ -38,6 +37,8 @@ The trajectory shows what the verifier actually found (or didn't find) on screen
 - The expected text was wrong → use the text that actually appeared
 - The element exists but with a different role → fix the role
 If verification passed, the current condition is correct — leave it.
+
+If local validation passed but the overall task failed, strengthen the skill with a check that exercises the missing external invariant and an action that creates the artifact in that invariant-preserving way. Derive that invariant from the user/task instruction, task-visible inputs, saved output, and logs. Prefer independent rediscovery from the saved output and task-visible inputs over checks that repeat the same manifest or helper assumptions.
 
 ### 5. Handle unexpected UI states
 If the trajectory shows the executor encountered something the skill didn't predict (a confirmation dialog, a loading spinner that needed waiting, a permission prompt), add a branch to handle it.

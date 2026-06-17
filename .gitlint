@@ -1,0 +1,16 @@
+[general]
+ignore-merge-commits=true
+ignore-revert-commits=true
+
+[title-max-length]
+line-length=72
+
+[title-match-regex]
+regex=^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-z0-9_./-]+\))?: [a-z].*$
+
+[title-trailing-punctuation]
+
+[body-is-missing]
+ignore-merge-commits=true
+
+[body-leading-blank]

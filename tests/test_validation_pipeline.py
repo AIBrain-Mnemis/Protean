@@ -51,7 +51,7 @@ def _make_skill(**overrides: Any) -> Skill:
                 name="open-settings",
                 action="Click the Settings button in TestApp.",
                 target_app="TestApp",
-                tool="find_elements(app='TestApp', query='Settings') -> click_at(center_x, center_y)",
+                tool="activate_app(app='TestApp') -> left_click(x=100, y=100)",
                 verify_condition=VerifyCondition(
                     strategy="ax_element",
                     ax_role="AXButton",
@@ -62,7 +62,7 @@ def _make_skill(**overrides: Any) -> Skill:
                 name="enable-dark-mode",
                 action="Toggle the Dark Mode switch.",
                 target_app="TestApp",
-                tool="click_at(x, y)",
+                tool="screenshot() -> left_click(x=100, y=100)",
                 verify_condition=VerifyCondition(
                     strategy="text_content",
                     expected_text="Dark Mode: On",
@@ -139,7 +139,15 @@ class FakePlatform:
 
     def get_displays(self) -> list:
         from protean.platform.base import DisplayInfo
-        return [DisplayInfo(display_id=1, display_index=1, width=1920, height=1080, is_primary=True)]
+        return [
+            DisplayInfo(
+                display_id=1,
+                display_index=1,
+                width=1920,
+                height=1080,
+                is_primary=True,
+            )
+        ]
 
     def get_active_window(self):
         return None
@@ -231,7 +239,13 @@ class FakeExecutor:
         self._start_count = 0
         self._send_count = 0
 
-    async def start_task(self, instruction: str, context: str = "", images: Any = None, **kwargs: Any) -> None:
+    async def start_task(
+        self,
+        instruction: str,
+        context: str = "",
+        images: Any = None,
+        **kwargs: Any,
+    ) -> None:
         self._started = True
         self._start_count += 1
 
@@ -731,7 +745,12 @@ class TestTelemetry:
                 mode=RunMode.VALIDATE,
                 steps=[
                     StepValidation(index=0, result=StepResult.PASSED, attempts=1),
-                    StepValidation(index=1, result=StepResult.FAILED, attempts=3, reason="AX failed"),
+                    StepValidation(
+                        index=1,
+                        result=StepResult.FAILED,
+                        attempts=3,
+                        reason="AX failed",
+                    ),
                 ],
                 duration=2.5,
             )

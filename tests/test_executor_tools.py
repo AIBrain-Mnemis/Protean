@@ -4,9 +4,17 @@ import asyncio
 import contextlib
 from pathlib import Path
 
+from protean.executor.actions import ActionExecutor
 from protean.executor.providers.computer_use import ComputerUseExecutor
-from protean.platform.base import ClipboardContent, DisplayInfo, ElementInfo, WindowInfo
-from protean.realtime.tool_handlers import execute_tool
+from protean.platform.base import (
+    LLM_SCREENSHOT_HEIGHT,
+    LLM_SCREENSHOT_WIDTH,
+    ClipboardContent,
+    CoordinateMapper,
+    DisplayInfo,
+    ElementInfo,
+    WindowInfo,
+)
 
 
 class FakePlatform:
@@ -152,31 +160,45 @@ class FakePlatform:
         Image.new("RGB", (100, 100), (0, 0, 0)).save(str(output_path))
 
 
-def test_activate_app_reports_display(monkeypatch):
-    platform = FakePlatform()
-    monkeypatch.setattr("protean.realtime.tool_handlers.time.sleep", lambda _: None)
+def _make_actions(platform: FakePlatform) -> ActionExecutor:
+    mapper = CoordinateMapper(platform, LLM_SCREENSHOT_WIDTH, LLM_SCREENSHOT_HEIGHT)
+    mapper.refresh()
+    return ActionExecutor(platform, mapper)
 
-    result = execute_tool(platform, "activate_app", {"app": "Microsoft Teams"})
+
+def test_activate_app_reports_active_window_in_api_coordinates():
+    platform = FakePlatform()
+    actions = _make_actions(platform)
+
+    result = asyncio.run(
+        actions.dispatch(
+            "activate_app",
+            {"app": "Microsoft Teams"},
+            include_screenshot=False,
+        )
+    )
 
     assert platform.activated_apps == ["Microsoft Teams"]
-    assert result == (
-        "Activated Microsoft Teams."
-        " Active window: Microsoft Teams title='Meeting' frame=(x=2000, y=100, w=1200, h=800)"
-        " display=2 bounds=(x=1728, y=0, w=2560, h=1440, primary=False)"
+    assert result.text == (
+        "Activated Microsoft Teams. Active window: \"Meeting\" "
+        "(Microsoft Teams) at (109, 40) size 480x320"
     )
 
 
-def test_click_at_uses_global_coordinates():
+def test_left_click_maps_api_coordinates_to_active_display():
     platform = FakePlatform()
+    actions = _make_actions(platform)
 
-    result = execute_tool(platform, "click_at", {"x": 2100, "y": 480})
+    result = asyncio.run(
+        actions.dispatch(
+            "left_click",
+            {"x": 149, "y": 192},
+            include_screenshot=False,
+        )
+    )
 
     assert platform.clicked_points == [(2100, 480)]
-    assert result == (
-        "Clicked at (2100, 480) using global coordinates."
-        " Active window: Microsoft Teams title='Meeting' frame=(x=2000, y=100, w=1200, h=800)"
-        " display=2 bounds=(x=1728, y=0, w=2560, h=1440, primary=False)"
-    )
+    assert result.text == "Clicked at (149, 192)"
 
 
 def test_computer_use_tool_error_includes_schema_hint():
@@ -224,127 +246,3 @@ def test_computer_use_reasoning_truncated_as_content_placeholder():
     assert result.endswith(" [truncated]")
 
 
-def test_click_returns_post_action_window_summary():
-    platform = FakePlatform()
-
-    result = execute_tool(
-        platform,
-        "click",
-        {"app": "Microsoft Teams", "label": "Share"},
-    )
-
-    assert platform.clicked_points == [(2200, 260)]
-    assert result == (
-        "Clicked 'Share' at (2200, 260) in Microsoft Teams."
-        " Active window: Microsoft Teams title='Meeting' frame=(x=2000, y=100, w=1200, h=800)"
-        " display=2 bounds=(x=1728, y=0, w=2560, h=1440, primary=False)"
-    )
-
-
-def test_click_at_can_return_action_view(monkeypatch):
-    platform = FakePlatform()
-    monkeypatch.setattr(
-        "protean.realtime.tool_handlers._capture_action_view",
-        lambda p, x, y, tool_name: {
-            "path": "/tmp/protean_action_views/action_view_test.png",
-            "origin_x": 1780,
-            "origin_y": 240,
-            "width": 640,
-            "height": 480,
-        },
-    )
-
-    result = execute_tool(
-        platform,
-        "click_at",
-        {"x": 2100, "y": 480, "include_action_view": True},
-    )
-
-    assert "Action view: path=/tmp/protean_action_views/action_view_test.png" in result
-    assert "action_view_rect(global)=(x=1780, y=240, w=640, h=480)" in result
-
-
-def test_move_can_return_action_view(monkeypatch):
-    platform = FakePlatform()
-    moved_points: list[tuple[int, int]] = []
-    platform.move_cursor = lambda x, y: moved_points.append((x, y))
-    monkeypatch.setattr(
-        "protean.realtime.tool_handlers._capture_action_view",
-        lambda p, x, y, tool_name: {
-            "path": "/tmp/protean_action_views/action_view_move.png",
-            "origin_x": 1728,
-            "origin_y": 0,
-            "width": 640,
-            "height": 480,
-        },
-    )
-
-    result = execute_tool(
-        platform,
-        "move",
-        {"x": 40, "y": 30, "coordinate_mode": "window", "include_action_view": True},
-    )
-
-    assert moved_points == [(2040, 130)]
-    assert "Action view: path=/tmp/protean_action_views/action_view_move.png" in result
-    assert "action_view_rect(window)=(x=-272, y=-100, w=640, h=480)" in result
-
-
-def test_click_at_display_mode_returns_display_relative_action_point(monkeypatch):
-    platform = FakePlatform()
-    monkeypatch.setattr(
-        "protean.realtime.tool_handlers._capture_action_view",
-        lambda p, x, y, tool_name: {
-            "path": "/tmp/protean_action_views/action_view_display.png",
-            "origin_x": 1728,
-            "origin_y": 0,
-            "width": 640,
-            "height": 480,
-        },
-    )
-
-    result = execute_tool(
-        platform,
-        "click_at",
-        {
-            "x": 100,
-            "y": 50,
-            "coordinate_mode": "display",
-            "display": 2,
-            "include_action_view": True,
-        },
-    )
-
-    assert "action_view_rect(display)=(x=0, y=0, w=640, h=480)" in result
-
-
-def test_click_at_uses_display_relative_coordinates():
-    platform = FakePlatform()
-
-    result = execute_tool(
-        platform,
-        "click_at",
-        {"x": 100, "y": 50, "coordinate_mode": "display", "display": 2},
-    )
-
-    assert platform.clicked_points == [(1828, 50)]
-    assert result == (
-        "Clicked at (1828, 50) using display 2 coordinates."
-        " Active window: Microsoft Teams title='Meeting' frame=(x=2000, y=100, w=1200, h=800)"
-        " display=2 bounds=(x=1728, y=0, w=2560, h=1440, primary=False)"
-    )
-
-
-def test_move_uses_window_relative_coordinates():
-    platform = FakePlatform()
-    moved_points: list[tuple[int, int]] = []
-    platform.move_cursor = lambda x, y: moved_points.append((x, y))
-
-    result = execute_tool(
-        platform,
-        "move",
-        {"x": 40, "y": 30, "coordinate_mode": "window"},
-    )
-
-    assert moved_points == [(2040, 130)]
-    assert result == "Moved cursor to (2040, 130) using active window coordinates"

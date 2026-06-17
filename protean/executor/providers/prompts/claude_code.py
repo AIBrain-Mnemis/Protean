@@ -39,7 +39,8 @@ Typing and keyboard rules:
 - key_press keys are joined by "+": "ctrl+c", "ctrl+shift+s", "enter", "tab".
 
 Coordinate rules:
-- All coordinates are screen-absolute (global coordinates).
+- Coordinates for left_click, right_click, double_click, mouse_move, and scroll
+  are relative to the latest screenshot image returned by Protean.
 - After window switches or popups, take a new screenshot before reusing
   prior coordinates.
 - When unsure about an on-screen label's language, screenshot first to read it.
@@ -58,9 +59,6 @@ General rules:
   autonomously or stop with a clear status message.
 
 Result format:
-- At the end of your response, list screenshots that show what changed
-  and helped you complete the task, one per line in this exact format:
-  KEY_SCREENSHOT: /path/to/file.png
-- Omit screenshots that were only used for navigation or verification.
-- If none are relevant, omit KEY_SCREENSHOT lines.
+- Summarize what you did. Protean captures tool-result screenshots directly;
+  do not output screenshot file paths.
 """

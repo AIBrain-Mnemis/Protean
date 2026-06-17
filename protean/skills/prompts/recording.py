@@ -90,13 +90,8 @@ When you generate a script, you MUST also wire it into the relevant step's `tool
 - Use the DETAIL images to identify button labels, menu items, field names.
 - Each step should be a logical workflow step and independently verifiable.
 - Choose the strategy that most reliably reaches the step's goal:
-    Strategy 0 (preferred when applicable): a shell command or script that
-      achieves the same end state — `run_terminal_command(...)` or
-      `run_script(filename.py, args)`.
-    Strategy A: when interacting with the GUI and the visible text is known —
-      find_elements(app, "visible label") -> click_at(center_x, center_y).
-    Strategy B: when GUI text lookup is insufficient —
-      screenshot -> visually locate -> move(..., include_action_view=True) -> click_at(...).
-  Prefer Strategy 0 over A/B whenever a verified command achieves the same
-  observable result; otherwise fall back to A, then B.
+   1. Scripted path: use `run_script(...)`, `run_terminal_command(...)`, or a verified keyboard shortcut when it preserves the demonstrated end state.
+   2. Accessibility/semantic GUI path: when the task must happen in the GUI, describe controls by stable labels, roles, field names, menu names, or durable relative layout. Do not preserve unstable implementation details such as recording-time coordinates, transient DOM/AX IDs, temporary ordering, or incidental window geometry.
+   3. Visual GUI path: use images only when no stable semantic target exists (for example icon-only controls, canvas content, drag targets, or visual comparison). Refer to figures or visual relationships, not pixel coordinates.
+  Pick the highest strategy that reliably reaches the same observable result.
 """ # noqa: E501

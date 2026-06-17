@@ -1,4 +1,4 @@
-"""Manual test for find_elements — matches executor output.
+"""Manual test for Platform.find_elements.
 
 Usage:
     uv run python tests/test_find_elements.py "Microsoft Teams" "发送"
@@ -9,9 +9,9 @@ Usage:
 from __future__ import annotations
 
 import sys
+import time
 
 from protean.platform import get_platform
-from protean.realtime.tool_handlers import execute_tool
 
 
 def main() -> None:
@@ -24,11 +24,19 @@ def main() -> None:
     p = get_platform()
 
     p.activate_app(app)
-    import time
     time.sleep(2)
 
-    result = execute_tool(p, "find_elements", {"app": app, "query": query})
-    print(result)
+    results = p.find_elements(app, query)
+    if not results:
+        print(f"No elements matching {query!r} found in {app}")
+        return
+    for i, el in enumerate(results, 1):
+        label = el.label if len(el.label) <= 80 else el.label[:77] + "..."
+        print(
+            f"{i}. {el.role}: {label!r} "
+            f"center=({el.center_x},{el.center_y}) "
+            f"size={el.width}x{el.height}"
+        )
 
 
 if __name__ == "__main__":

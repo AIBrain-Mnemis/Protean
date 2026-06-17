@@ -81,6 +81,7 @@ class ExecutorEvent:
     tool_name: str = ""
     tool_args: dict[str, Any] = field(default_factory=dict)
     result: str = ""
+    images: list[tuple[bytes, str, str]] = field(default_factory=list)
     message: str = ""
     error: str = ""
     reasoning: str = ""

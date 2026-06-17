@@ -505,12 +505,10 @@ class TeachSession:
             n = self._active_share_display
             extra["display_routing"] = (
                 f"The user is watching display {n}. To keep your view aligned "
-                f"with theirs: call screenshot(display={n}); when you click "
-                f"or move based on screenshot pixels, call click_at(x, y, "
-                f"coordinate_mode='display', display={n}) and likewise for "
-                f"move(...). Tools without a display argument (find_elements, "
-                f"type_text, key_press, activate_app, menu_click) are scoped "
-                f"by app or focused element and need no display routing."
+                f"with theirs, activate the target app and use the screenshot "
+                f"returned by activate_app for left_click, mouse_move, or scroll "
+                f"coordinates. Keyboard and clipboard tools are "
+                f"scoped by the focused element and need no display routing."
             )
         return ExecutorContext(task=self._task, completed_steps=completed, extra=extra)
 
@@ -574,10 +572,9 @@ class TeachSession:
         if self._active_share_mode in ("share", "observe"):
             label = self._active_share_label or "unknown surface"
             display_hint = (
-                f" Use screenshot(display={self._active_share_display}) and "
-                f"click_at(..., coordinate_mode='display', "
-                f"display={self._active_share_display}) so your view and "
-                f"actions match the user's display."
+                " Activate the target app and use the screenshot returned by "
+                "activate_app for left_click, mouse_move, or scroll "
+                "coordinates so your view and actions match the user's display."
                 if (
                     self._active_share_mode == "share"
                     and self._active_share_display is not None
@@ -648,11 +645,11 @@ class TeachSession:
     async def _collect_executor_result(self) -> tuple[str, list[tuple[bytes, float]]]:
         """Consume executor events until completion and return result + key screenshots."""
         from protean.executor import ExecutorEventType as EET
-        from protean.realtime.tool_handlers import extract_screenshot_paths
 
         done_msg = ""
         all_messages = []
-        all_screenshot_paths: dict[str, float] = {}
+        finished_ts = 0.0
+        screenshots: list[tuple[bytes, float]] = []
 
         start_ts = time.monotonic()
         async for evt in self._executor.get_events():
@@ -665,43 +662,31 @@ class TeachSession:
                 log.info("Executor tool: %s", evt.tool_name)
             elif evt.type == EET.TOOL_RESULT:
                 ts = time.monotonic()
-                for p in extract_screenshot_paths(evt.result):
-                    all_screenshot_paths[p] = ts
+                overview_images = [img for img in evt.images if img[2] != "detail"]
+                for data, _mime, _role in overview_images or evt.images[:1]:
+                    screenshots.append((data, ts))
             elif evt.type == EET.MESSAGE:
                 self._executor_messages.append((time.monotonic(), evt.message))
                 self._executor_messages = self._executor_messages[-5:]
                 all_messages.append(evt.message)
             elif evt.type == EET.DONE:
                 done_msg = evt.message
+                finished_ts = time.monotonic()
                 log.info(
                     "Executor DONE after %.1fs (msg_len=%d, messages=%d)",
-                    time.monotonic() - start_ts, len(done_msg), len(all_messages),
+                    finished_ts - start_ts, len(done_msg), len(all_messages),
                 )
                 break
             elif evt.type == EET.ERROR:
                 done_msg = evt.error or evt.message or "Unknown error"
+                finished_ts = time.monotonic()
                 log.warning(
                     "Executor ERROR after %.1fs: %s",
-                    time.monotonic() - start_ts, done_msg[:200],
+                    finished_ts - start_ts, done_msg[:200],
                 )
                 break
 
         result = done_msg or (all_messages[-1] if all_messages else "Done")
-
-        all_text = "\n".join(all_messages) + "\n" + done_msg
-        key_paths = set()
-        for line in all_text.split("\n"):
-            if line.strip().startswith("KEY_SCREENSHOT:"):
-                key_paths.add(line.split("KEY_SCREENSHOT:", 1)[1].strip())
-
-        screenshots = []
-        for path in key_paths:
-            if path in all_screenshot_paths:
-                try:
-                    data = Path(path).read_bytes()
-                    screenshots.append((data, all_screenshot_paths[path]))
-                except Exception:
-                    log.warning("Could not read executor screenshot: %s", path)
 
         # Skip the talker notification when this DONE was an interrupt —
         # the interrupt_executor tool already returned "Execution
@@ -712,11 +697,7 @@ class TeachSession:
             log.info("Skipping DONE notification for interrupt (avoids double signal)")
             return result, screenshots
 
-        notify_lines = [
-            line for line in result.split("\n")
-            if not line.startswith("KEY_SCREENSHOT:")
-        ]
-        notify_text = "\n".join(notify_lines)[:300]
+        notify_text = result[:300]
         log.info(
             "Sending DONE notification to talker (len=%d, screenshots=%d): %s",
             len(notify_text), len(screenshots), notify_text[:120].replace("\n", " | "),

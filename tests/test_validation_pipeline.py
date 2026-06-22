@@ -134,6 +134,20 @@ class FakePlatform:
     def find_elements(self, app: str, query: str) -> list[FakeElementInfo]:
         return [e for e in self._elements if query.lower() in e.label.lower()]
 
+    def accessibility_snapshot(
+        self,
+        query: str = "",
+        *,
+        app: str = "",
+        visible_bounds=None,
+        max_nodes: int,
+        max_visited: int,
+        timeout: float,
+    ):
+        from protean.platform.base import AccessibilitySnapshot
+
+        return AccessibilitySnapshot()
+
     def capture_display(self, display_index: int, output_path: Path) -> None:
         output_path.write_bytes(self._screenshot_bytes)
 

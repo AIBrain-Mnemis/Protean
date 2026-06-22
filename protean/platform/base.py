@@ -57,6 +57,24 @@ class DisplayInfo:
     is_primary: bool = False
 
 
+@dataclass(frozen=True)
+class Rect:
+    """Rectangle in global screen coordinates."""
+
+    x: int
+    y: int
+    width: int
+    height: int
+
+    def intersects(self, other: "Rect") -> bool:
+        return not (
+            self.x + self.width <= other.x
+            or other.x + other.width <= self.x
+            or self.y + self.height <= other.y
+            or other.y + other.height <= self.y
+        )
+
+
 @dataclass
 class ScreenshotResult:
     """Result of a screenshot capture."""
@@ -79,6 +97,36 @@ class ElementInfo:
     center_y: int
     width: int
     height: int
+
+
+@dataclass(frozen=True)
+class AccessibilityNode:
+    """Cleaned accessibility node with global screen geometry."""
+
+    id: str
+    role: str
+    raw_role: str
+    label: str
+    value: str
+    description: str
+    x: int
+    y: int
+    width: int
+    height: int
+    depth: int
+    states: tuple[str, ...] = ()
+    actions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AccessibilitySnapshot:
+    """Cleaned accessibility context for the current active UI surface."""
+
+    app: str = ""
+    window_title: str = ""
+    nodes: list[AccessibilityNode] = field(default_factory=list)
+    truncated: bool = False
+    unavailable_reason: str = ""
 
 
 @runtime_checkable
@@ -323,6 +371,25 @@ class Platform(Protocol):
         """Return the AX role of an element found by label, or None."""
         ...
 
+    def accessibility_snapshot(
+        self,
+        query: str = "",
+        *,
+        app: str = "",
+        visible_bounds: Rect | None = None,
+        max_nodes: int,
+        max_visited: int,
+        timeout: float,
+    ) -> AccessibilitySnapshot:
+        """Return cleaned accessibility context for the active window.
+
+        Coordinates are global screen coordinates. Callers that present a
+        resized screenshot should project them into screenshot space.
+        """
+        return AccessibilitySnapshot(
+            unavailable_reason=f"accessibility snapshot is not implemented on {self.name}",
+        )
+
     def activate_app(self, app: str) -> None:
         """Bring an application to the foreground."""
         ...
@@ -471,6 +538,29 @@ class DisplayScale:
         ax = int(round((actual_x - self.origin_x) * self.api_w / self.actual_w))
         ay = int(round((actual_y - self.origin_y) * self.api_h / self.actual_h))
         return ax, ay
+
+    def visible_api_rect(
+        self,
+        actual_x: int,
+        actual_y: int,
+        actual_w: int,
+        actual_h: int,
+    ) -> tuple[int, int, int, int] | None:
+        """Project a real screen rect into API space and intersect it with the screenshot."""
+        x1, y1 = self.to_api(actual_x, actual_y)
+        x2, y2 = self.to_api(actual_x + actual_w, actual_y + actual_h)
+        left = min(x1, x2)
+        top = min(y1, y2)
+        right = max(x1, x2)
+        bottom = max(y1, y2)
+
+        rect_x = max(0, left)
+        rect_y = max(0, top)
+        rect_right = min(self.api_w, right)
+        rect_bottom = min(self.api_h, bottom)
+        if rect_x >= rect_right or rect_y >= rect_bottom:
+            return None
+        return rect_x, rect_y, rect_right - rect_x, rect_bottom - rect_y
 
 
 class CoordinateMapper:

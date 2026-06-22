@@ -9,10 +9,12 @@ from protean.executor.providers.computer_use import ComputerUseExecutor
 from protean.platform.base import (
     LLM_SCREENSHOT_HEIGHT,
     LLM_SCREENSHOT_WIDTH,
+    AccessibilitySnapshot,
     ClipboardContent,
     CoordinateMapper,
     DisplayInfo,
     ElementInfo,
+    Rect,
     WindowInfo,
 )
 
@@ -137,6 +139,18 @@ class FakePlatform:
 
     def get_element_role(self, app: str, label: str) -> str | None:
         return None
+
+    def accessibility_snapshot(
+        self,
+        query: str = "",
+        *,
+        app: str = "",
+        visible_bounds: Rect | None = None,
+        max_nodes: int,
+        max_visited: int,
+        timeout: float,
+    ) -> AccessibilitySnapshot:
+        return AccessibilitySnapshot(app="Microsoft Teams", window_title="Meeting")
 
     def activate_app(self, app: str) -> None:
         self.activated_apps.append(app)

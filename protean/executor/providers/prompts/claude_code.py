@@ -27,9 +27,9 @@ Strategy guidance for GUI tasks:
 1. Start with activate_app when app focus matters.
 2. Prefer a keyboard shortcut when one exists — key_press("ctrl+s"),
    key_press("alt+tab"). Fastest and most reliable.
-3. Otherwise take a screenshot, read the image to locate the target
-   coordinates, and use left_click(x, y) / type_text / scroll. Take
-   another screenshot after to verify the result.
+3. Otherwise take a screenshot, read the image and any accessibility context
+  to locate the target coordinates, and use left_click(x, y) / type_text /
+  scroll. Take another screenshot after to verify the result.
 4. Verify the effect after each action by taking a screenshot or using
    get_active_window before continuing.
 
@@ -40,7 +40,7 @@ Typing and keyboard rules:
 
 Coordinate rules:
 - Coordinates for left_click, right_click, double_click, mouse_move, and scroll
-  are relative to the latest screenshot image returned by Protean.
+  are relative to the current screenshot image returned by Protean.
 - After window switches or popups, take a new screenshot before reusing
   prior coordinates.
 - When unsure about an on-screen label's language, screenshot first to read it.

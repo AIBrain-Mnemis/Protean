@@ -20,7 +20,16 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
-from protean.platform.base import ClipboardContent, DisplayInfo, ElementInfo, Platform, WindowInfo
+from protean.platform.base import (
+    AccessibilityNode,
+    AccessibilitySnapshot,
+    ClipboardContent,
+    DisplayInfo,
+    ElementInfo,
+    Platform,
+    Rect,
+    WindowInfo,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1637,6 +1646,183 @@ class WindowsPlatform(Platform):
         if not results:
             log.warning("find_elements(%r, %r): 0 results", app, query)
         return results
+
+    def accessibility_snapshot(
+        self,
+        query: str = "",
+        *,
+        app: str = "",
+        visible_bounds: Rect | None = None,
+        max_nodes: int,
+        max_visited: int,
+        timeout: float,
+    ) -> AccessibilitySnapshot:
+        try:
+            import uiautomation  # noqa: F401
+        except ImportError as e:
+            return AccessibilitySnapshot(
+                unavailable_reason=f"uiautomation not importable: {e}",
+            )
+
+        target_app = app.strip()
+        active = self.get_active_window()
+        if not target_app:
+            if active is None:
+                return AccessibilitySnapshot(unavailable_reason="no active window")
+            target_app = active.process_name or active.window_title
+        win = self._find_app_window(target_app, timeout=timeout)
+        if win is None:
+            return AccessibilitySnapshot(
+                app=target_app,
+                unavailable_reason=f"application window not found: {target_app}",
+            )
+
+        query_lower = query.lower().strip()
+        deadline = time.monotonic() + timeout
+        max_depth = 25
+        nodes: list[AccessibilityNode] = []
+        seen: set[tuple[str, str, int, int, int, int]] = set()
+        node_index = 1
+        visited = 0
+        truncated = False
+        default_types = {
+            "ButtonControl", "EditControl", "CheckBoxControl", "RadioButtonControl",
+            "ComboBoxControl", "ListItemControl", "TabItemControl", "HyperlinkControl",
+            "MenuItemControl", "SliderControl", "DocumentControl",
+        }
+        stack: list[tuple[object, int]] = [(win, 0)]
+
+        while stack:
+            if time.monotonic() > deadline:
+                truncated = True
+                break
+            visited += 1
+            if visited > max_visited:
+                truncated = True
+                break
+            el, depth = stack.pop()
+            if depth > max_depth:
+                truncated = True
+                continue
+
+            try:
+                control_type = el.ControlTypeName or ""
+            except Exception:
+                continue
+            if control_type in _UIA_SKIP_TYPES:
+                continue
+
+            rect: Rect | None = None
+            try:
+                raw_rect = el.BoundingRectangle
+                width = int(raw_rect.width())
+                height = int(raw_rect.height())
+                if width >= 5 and height >= 5:
+                    rect = Rect(int(raw_rect.left), int(raw_rect.top), width, height)
+            except Exception:
+                rect = None
+
+            visible = visible_bounds is None or rect is None or rect.intersects(visible_bounds)
+
+            name = ""
+            automation_id = ""
+            help_text = ""
+            query_hit = False
+            for getter_name, getter in (
+                ("name", lambda: el.Name or ""),
+                ("automation_id", lambda: el.AutomationId or ""),
+                ("help_text", lambda: getattr(el, "HelpText", "") or ""),
+            ):
+                try:
+                    text = str(getter()).strip()[:120]
+                except Exception:
+                    text = ""
+                if getter_name == "name":
+                    name = text
+                elif getter_name == "automation_id":
+                    automation_id = text
+                else:
+                    help_text = text
+                if query_lower and getter_name != "automation_id" and query_lower in text.lower():
+                    query_hit = True
+                    break
+
+            role = _UIA_ROLE_MAP.get(control_type, control_type)
+            query_matches = not query_lower or query_hit or query_lower in role.lower()
+
+            states: list[str] = []
+            try:
+                if bool(getattr(el, "IsEnabled", False)):
+                    states.append("enabled")
+            except Exception:
+                pass
+            try:
+                if bool(getattr(el, "HasKeyboardFocus", False)):
+                    states.append("focused")
+            except Exception:
+                pass
+
+            include_default = control_type in default_types or "focused" in states
+            label = name or automation_id or help_text
+            if (
+                query_matches
+                and visible
+                and (query_lower or include_default)
+                and rect is not None
+                and label
+            ):
+                key = (role, label, rect.x, rect.y, rect.width, rect.height)
+                if key not in seen:
+                    actions: list[str] = []
+                    if control_type in {
+                        "ButtonControl", "CheckBoxControl", "RadioButtonControl",
+                        "ComboBoxControl", "ListItemControl", "TabItemControl",
+                        "HyperlinkControl", "MenuItemControl",
+                    }:
+                        actions.append("press")
+                    if control_type in {"EditControl", "ComboBoxControl", "DocumentControl"}:
+                        actions.extend(["focus", "set_text"])
+
+                    seen.add(key)
+                    nodes.append(AccessibilityNode(
+                        id=str(node_index),
+                        role=role,
+                        raw_role=control_type,
+                        label=name,
+                        value=automation_id,
+                        description=help_text,
+                        x=rect.x,
+                        y=rect.y,
+                        width=rect.width,
+                        height=rect.height,
+                        depth=depth,
+                        states=tuple(states),
+                        actions=tuple(actions),
+                    ))
+                    node_index += 1
+                    if len(nodes) >= max_nodes:
+                        truncated = bool(stack)
+                        break
+
+            try:
+                children = el.GetChildren()
+            except Exception:
+                continue
+            if children:
+                for i in range(len(children) - 1, -1, -1):
+                    stack.append((children[i], depth + 1))
+
+        window_title = ""
+        try:
+            window_title = win.Name or ""
+        except Exception:
+            pass
+        return AccessibilitySnapshot(
+            app=target_app,
+            window_title=window_title,
+            nodes=nodes,
+            truncated=truncated,
+        )
 
     def get_element_role(self, app: str, label: str) -> str | None:
         el = self._find_uia_element(app, label)

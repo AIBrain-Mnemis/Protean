@@ -132,10 +132,7 @@ class ActionExecutor:
         app: str = "",
     ) -> ActionResult:
         screenshot_b64 = self.take_screenshot()
-        context = self._screenshot_context_text()
-        a11y_context = self._accessibility_context_text(query, app=app)
-        if a11y_context:
-            context = f"{context}\n{a11y_context}"
+        context = self._observation_context_text(query, app=app)
         result_text = context if text is None else f"{text}. {context}"
         return ActionResult(text=result_text, screenshot_b64=screenshot_b64)
 
@@ -346,6 +343,13 @@ class ActionExecutor:
             f"x=0..{width - 1}, y=0..{height - 1}."
         )
 
+    def _observation_context_text(self, query: str = "", *, app: str = "") -> str:
+        context = self._screenshot_context_text()
+        a11y_context = self._accessibility_context_text(query, app=app)
+        if a11y_context:
+            return f"{context}\n{a11y_context}"
+        return context
+
     def _accessibility_context_text(self, query: str = "", *, app: str = "") -> str:
         budget = A11Y_QUERY_NODE_BUDGET if query.strip() else A11Y_NODE_BUDGET
         scale = self._mapper.scale
@@ -441,7 +445,7 @@ class ActionExecutor:
         if not include_screenshot:
             return ActionResult(text=base_text)
         ss = self.take_screenshot()
-        context = self._screenshot_context_text()
+        context = self._observation_context_text()
         crop = self.detail_crop(ix, iy)
         caption: str | None = None
         if crop is not None:

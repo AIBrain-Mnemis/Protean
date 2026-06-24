@@ -9,6 +9,7 @@ from protean.executor.providers.computer_use import ComputerUseExecutor
 from protean.platform.base import (
     LLM_SCREENSHOT_HEIGHT,
     LLM_SCREENSHOT_WIDTH,
+    AccessibilityNode,
     AccessibilitySnapshot,
     ClipboardContent,
     CoordinateMapper,
@@ -213,6 +214,50 @@ def test_left_click_maps_api_coordinates_to_active_display():
 
     assert platform.clicked_points == [(2100, 480)]
     assert result.text == "Clicked at (149, 192)"
+
+
+def test_coordinate_action_screenshot_includes_accessibility_context():
+    class A11yPlatform(FakePlatform):
+        def accessibility_snapshot(
+            self,
+            query: str = "",
+            *,
+            app: str = "",
+            visible_bounds: Rect | None = None,
+            max_nodes: int,
+            max_visited: int,
+            timeout: float,
+        ) -> AccessibilitySnapshot:
+            return AccessibilitySnapshot(
+                app=app or "TestApp",
+                window_title="TestWindow",
+                nodes=[
+                    AccessibilityNode(
+                        id="1",
+                        role="button",
+                        raw_role="AXButton",
+                        label="Run",
+                        value="",
+                        description="",
+                        x=2000,
+                        y=120,
+                        width=100,
+                        height=40,
+                        depth=1,
+                        actions=("press",),
+                    ),
+                ],
+            )
+
+    platform = A11yPlatform()
+    actions = _make_actions(platform)
+
+    result = asyncio.run(actions.dispatch("left_click", {"x": 10, "y": 10}))
+
+    assert result.screenshot_b64 is not None
+    assert result.text is not None
+    assert "Accessibility context" in result.text
+    assert "button 'Run'" in result.text
 
 
 def test_computer_use_tool_error_includes_schema_hint():

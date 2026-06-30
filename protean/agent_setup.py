@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -201,7 +202,7 @@ Invoking the Protean CLI: prefer the bare `protean` command. If the shell report
 - POSIX (macOS / Linux): `~/.local/bin/protean`
 - Windows (PowerShell / cmd): `%USERPROFILE%\\.local\\bin\\protean.cmd`
 This applies to every `protean ...` invocation (`skills`, `record`, `generate`, `daemon`, `trajectories`, etc.).
-"""
+"""  # noqa: E501
 
 
 def inject_instructions(target: AgentTarget, skill: "Skill") -> Path | None:
@@ -231,10 +232,26 @@ def inject_instructions(target: AgentTarget, skill: "Skill") -> Path | None:
 # (TOML uses tomlkit for structured edits and does not need sentinels.)
 
 
+def _mcp_command_args() -> tuple[str, list[str]]:
+    """Return the command + args to launch the Protean MCP server.
+
+    Uses the absolute path of the current interpreter with ``-m protean``
+    rather than the bare ``protean`` shim. Agent runtimes (e.g. Codex
+    Desktop) spawn MCP servers with a minimal PATH that excludes
+    ``~/.local/bin``, so the shim's ``exec uv`` fails with
+    ``uv: not found``. An absolute interpreter path needs no PATH lookup
+    and no ``uv``.
+    """
+    if sys.executable:
+        return sys.executable, ["-m", "protean", "mcp"]
+    return "protean", ["mcp"]
+
+
 def _mcp_toml_table() -> "tomlkit.items.Table":
+    command, args = _mcp_command_args()
     table = tomlkit.table()
-    table["command"] = "protean"
-    table["args"] = ["mcp"]
+    table["command"] = command
+    table["args"] = args
     return table
 
 
@@ -276,10 +293,11 @@ def inject_mcp_config(target: AgentTarget) -> Path | None:
         else:
             data = {}
         servers = data.setdefault("mcpServers", {})
+        command, args = _mcp_command_args()
         servers[_MCP_SERVER_NAME] = {
             "type": "stdio",
-            "command": "protean",
-            "args": ["mcp"],
+            "command": command,
+            "args": args,
             "env": {},
         }
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")

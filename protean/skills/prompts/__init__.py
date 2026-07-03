@@ -10,6 +10,7 @@ from protean.skills.prompts.finalize import FINALIZE_PROMPT
 from protean.skills.prompts.output_hotspot_hint import OUTPUT_HOTSPOT_HINT_PROMPT
 from protean.skills.prompts.recording import RECORDING_SYSTEM_PROMPT
 from protean.skills.prompts.refine import REFINE_PROMPT
+from protean.skills.prompts.skill_authoring_rules import SKILL_AUTHORING_RULES
 from protean.skills.prompts.step_field_rules import STEP_FIELD_RULES
 
 __all__ = [
@@ -19,5 +20,6 @@ __all__ = [
     "OUTPUT_HOTSPOT_HINT_PROMPT",
     "RECORDING_SYSTEM_PROMPT",
     "REFINE_PROMPT",
+    "SKILL_AUTHORING_RULES",
     "STEP_FIELD_RULES",
 ]

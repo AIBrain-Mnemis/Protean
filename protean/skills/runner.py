@@ -91,7 +91,7 @@ class StepValidation:
 class ExecutorAction:
     """A single physical action the executor took during a step."""
 
-    tool_name: str = ""       # e.g. "screenshot", "click_at", "find_elements"
+    tool_name: str = ""       # e.g. "screenshot", "left_click", "key_press"
     tool_args: dict = field(default_factory=dict)
     result: str = ""          # tool result or text message
     event_type: str = ""      # "tool_call", "tool_result", "message"
@@ -647,6 +647,7 @@ class StepRunner:
                     tool_name=evt.tool_name,
                     result=evt.result,
                     event_type="tool_result",
+                    images=evt.images,
                 ))
             elif evt.type == EET.MESSAGE:
                 msg = evt.message or evt.reasoning or ""
@@ -729,6 +730,7 @@ class StepRunner:
                     tool_name=evt.tool_name,
                     result=evt.result,
                     event_type="tool_result",
+                    images=evt.images,
                 ))
             elif evt.type == EET.MESSAGE:
                 msg = evt.message or evt.reasoning or ""

@@ -31,24 +31,35 @@ These rules apply to every decision below.
 
 ## Decision rules
 
-Trajectories may contain reusable knowledge even when the task failed.
+### Evidence boundary
 
-Failures can reveal:
-- useful partial workflows,
-- debugging strategies,
-- common pitfalls,
-- verification techniques,
-- or corrective patterns.
+Use the provided trajectory as the evidence boundary. It contains the user/task instruction, attempted workflow, tool calls/results, saved-output clues, logs, final response, reward, failed tests, and verification text available to this evolution step.
 
-For each action, decide exactly one of:
+### Failed trajectories
 
-Each action is a learning contract, not a draft skill. Fill these fields:
+Failed trajectories can reveal reusable partial workflows, debugging strategies, common pitfalls, verification techniques, and corrective patterns.
+
+For failed runs:
+- Re-read the user/task instruction and derive the concrete requirements the run was supposed to satisfy. Compare them with observed workflow, outputs, logs, tests, reward, and final response; identify where the run likely fell short, such as an unmet instruction, wrong target, factual error, missing preservation, incomplete execution, or insufficient validation
+- If the trajectory does not reveal the true cause, state a focused hypothesis tied to a specific requirement and observed artifact. Distinguish between a likely execution/content error and a validation blind spot that allowed the error to pass; do not claim certainty beyond the evidence.
+- Prefer instruction-derived invariants when the instruction supports them, then generalize them into transferable rules rather than task-specific wording.
+- When the visible task or existing skill exposes a safe range, layout convention, invariant, or domain bound, use that visible constraint to propose a conservative rule and output check.
+
+### Successful trajectories
+
+Successful trajectories can reveal avoidable execution cost when the agent still had to read long skill text, dump broad helper output, inspect helper source or help repeatedly, write ad hoc probes, or run redundant checks before the working path was clear. Treat this as a refinement signal only when the trajectory gives concrete evidence of material cost and the reusable update can preserve correctness-critical validation.
+
+### Action contract
+
+For each action, decide exactly one operation. Each action is a learning contract, not a draft skill. Fill these fields:
 
 - skill_name: the stable skill key. The name should answer "when should an agent pick this skill", not describe internal implementation details. Use kebab-case. Name the underlying reusable capability, not the incidental task surface.
 - reason: why this library operation is appropriate.
-- intent: the focused change this action asks the builder to make. For create, this is the target capability. For refine, this is the desired update to the existing skill. For delete, this is the deprecation/removal intent.
-- observed_gap: the missing, incorrect, redundant, or underspecified capability in the current library.
+- intent: the focused change this action asks the builder to make. For create, this is the target capability. For refine, state the concrete behavior to add to the existing skill and the output check that proves it. For delete, this is the deprecation/removal intent.
+- observed_gap: the missing, incorrect, redundant, or underspecified capability in the current library. For failed runs, include the likely failure mechanism or validation blind spot inferred from the instruction, attempted workflow, output, logs, and verification result.
 - evidence: 3-8 short factual observations from the trajectory. Evidence must point to user messages, tool calls, tool results, errors, corrections, recovery steps, or verification outcomes.
+
+Promote causal lessons into the action contract. If the trajectory succeeded or failed because of a non-obvious decision rule, validation rule, recovery pattern, or inference strategy, name that reusable mechanism in `intent` or `observed_gap`. Use `evidence` only as factual support for the mechanism. For refine actions, `intent` must state the executable behavior the builder should add, including any causal decision rule that made the trajectory work or fail. When a trajectory contains both a surface workflow and the decision rule that made it correct, include both in the focused update.
 
 ### refine (preferred default)
 
@@ -59,6 +70,7 @@ Refine when:
 - the strategy was incomplete,
 - the validation / verification logic was insufficient,
 - the trajectory reveals a better generalized version of the skill,
+- a successful trajectory exposes a shorter fast path, compact helper output, trigger-based validation, or removal of redundant prose/tool probes,
 - or a locale / permission / UI / timing trap was newly discovered.
 
 Prefer refining a broader skill (and expanding its scope slightly) over creating a narrower specialized one.

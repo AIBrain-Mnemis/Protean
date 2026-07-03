@@ -23,7 +23,7 @@ import logging
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -45,8 +45,18 @@ from protean.executor import ExecutorContext, ExecutorEvent, ExecutorEventType, 
 from protean.executor.providers.prompts import CLAUDE_CODE_SYSTEM_PROMPT
 from protean.mcp import build_mcp_server
 from protean.platform.base import Platform, get_platform
+from protean.trajectories.base import extract_images, stringify_content
 
 log = logging.getLogger(__name__)
+
+PermissionMode = Literal[
+    "default",
+    "acceptEdits",
+    "plan",
+    "bypassPermissions",
+    "dontAsk",
+    "auto",
+]
 
 # ── Windows: force UTF-8 on subprocess text-mode pipes ──────────────────────
 # claude-agent-sdk (and MCP CLIs it spawns) emit UTF-8 on stdout/stderr. On
@@ -147,7 +157,7 @@ class ClaudeCodeExecutor(ExecutorProvider):
     def __init__(
         self,
         mcp_config: dict[str, Any] | None = None,
-        permission_mode: str = "bypassPermissions",
+        permission_mode: PermissionMode = "bypassPermissions",
         allowed_tools: list[str] | None = None,
         working_dir: str | None = None,
         system_prompt: str = "",
@@ -157,7 +167,7 @@ class ClaudeCodeExecutor(ExecutorProvider):
     ) -> None:
         self._platform = platform or get_platform()
         self._user_mcp_config = dict(mcp_config) if mcp_config else {}
-        self._permission_mode = permission_mode
+        self._permission_mode: PermissionMode = permission_mode
         self._allowed_tools = (
             allowed_tools if allowed_tools is not None else list(_DEFAULT_ALLOWED_TOOLS)
         )
@@ -171,6 +181,7 @@ class ClaudeCodeExecutor(ExecutorProvider):
         self._recv_task: asyncio.Task | None = None
         self._ask_server = self._build_ask_server()
         self._mcp_server = build_mcp_server(self._platform)
+        self._tool_names_by_id: dict[str, str] = {}
 
     # ------------------------------------------------------------ public API
 
@@ -454,6 +465,9 @@ class ClaudeCodeExecutor(ExecutorProvider):
                             message=block.text,
                         ))
                 elif isinstance(block, ToolUseBlock):
+                    tool_use_id = str(getattr(block, "id", "") or "")
+                    if tool_use_id:
+                        self._tool_names_by_id[tool_use_id] = block.name
                     self._event_queue.put_nowait(ExecutorEvent(
                         type=ExecutorEventType.TOOL_CALL,
                         tool_name=block.name,
@@ -466,17 +480,24 @@ class ClaudeCodeExecutor(ExecutorProvider):
                 for block in content:
                     if isinstance(block, ToolResultBlock):
                         result = block.content
-                        if isinstance(result, list):
-                            texts = [
-                                b.get("text", "") for b in result
-                                if isinstance(b, dict) and b.get("type") == "text"
-                            ]
-                            result_text = "\n".join(texts)
-                        else:
-                            result_text = str(result) if result is not None else ""
+                        result_text = stringify_content(result)
+                        tool_use_id = str(getattr(block, "tool_use_id", "") or "")
+                        tool_name = self._tool_names_by_id.pop(tool_use_id, "")
+                        from_protean = tool_name.startswith("mcp__protean__")
+                        raw_images = extract_images(result)
+                        images = [
+                            (
+                                data,
+                                mime,
+                                "detail" if from_protean and i == 1 else "overview",
+                            )
+                            for i, (data, mime) in enumerate(raw_images)
+                        ]
                         self._event_queue.put_nowait(ExecutorEvent(
                             type=ExecutorEventType.TOOL_RESULT,
+                            tool_name=tool_name,
                             result=result_text,
+                            images=images,
                         ))
         elif isinstance(msg, ResultMessage):
             self._event_queue.put_nowait(ExecutorEvent(

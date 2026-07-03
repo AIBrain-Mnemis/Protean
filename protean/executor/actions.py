@@ -36,17 +36,22 @@ from PIL import Image, ImageDraw, ImageFont
 
 from protean.platform.base import (
     LLM_JPEG_QUALITY,
+    Rect,
     parse_key_combo,
     prepare_screenshot_for_llm,
 )
 
 if TYPE_CHECKING:
-    from protean.platform.base import CoordinateMapper, Platform
+    from protean.platform.base import AccessibilityNode, CoordinateMapper, Platform
 
 log = logging.getLogger(__name__)
 
 # Pixel spacing of the coordinate grid drawn on the detail-crop view.
 DETAIL_GRID_STEP = 100
+A11Y_NODE_BUDGET = 80
+A11Y_QUERY_NODE_BUDGET = 24
+A11Y_TIMEOUT_SEC = 0.5
+A11Y_VISIT_BUDGET = 600
 
 
 @dataclass
@@ -119,9 +124,15 @@ class ActionExecutor:
         self._last_img = Image.open(io.BytesIO(jpeg_bytes)).copy()
         return base64.b64encode(jpeg_bytes).decode("ascii")
 
-    def screenshot_result(self, text: str | None = None) -> ActionResult:
+    def screenshot_result(
+        self,
+        text: str | None = None,
+        *,
+        query: str = "",
+        app: str = "",
+    ) -> ActionResult:
         screenshot_b64 = self.take_screenshot()
-        context = self._screenshot_context_text()
+        context = self._observation_context_text(query, app=app)
         result_text = context if text is None else f"{text}. {context}"
         return ActionResult(text=result_text, screenshot_b64=screenshot_b64)
 
@@ -256,9 +267,9 @@ class ActionExecutor:
 
     # ─── screenshot ────────────────────────────────────────────────────
 
-    def screenshot(self) -> ActionResult:
+    def screenshot(self, *, query: str = "") -> ActionResult:
         """Take a screenshot as its own action (no text confirmation)."""
-        return self.screenshot_result()
+        return self.screenshot_result(query=query)
 
     # ─── actions: app / window / clipboard ─────────────────────────────
 
@@ -279,7 +290,7 @@ class ActionExecutor:
             msg = f"Activated {app}"
         if not include_screenshot:
             return ActionResult(text=msg)
-        return self.screenshot_result(msg)
+        return self.screenshot_result(msg, app=app)
 
     def get_active_window(self) -> ActionResult:
         win = self._platform.get_active_window()
@@ -332,6 +343,96 @@ class ActionExecutor:
             f"x=0..{width - 1}, y=0..{height - 1}."
         )
 
+    def _observation_context_text(self, query: str = "", *, app: str = "") -> str:
+        context = self._screenshot_context_text()
+        a11y_context = self._accessibility_context_text(query, app=app)
+        if a11y_context:
+            return f"{context}\n{a11y_context}"
+        return context
+
+    def _accessibility_context_text(self, query: str = "", *, app: str = "") -> str:
+        budget = A11Y_QUERY_NODE_BUDGET if query.strip() else A11Y_NODE_BUDGET
+        scale = self._mapper.scale
+        snapshot = self._platform.accessibility_snapshot(
+            query.strip(),
+            app=app,
+            visible_bounds=Rect(scale.origin_x, scale.origin_y, scale.actual_w, scale.actual_h),
+            max_nodes=budget,
+            max_visited=A11Y_VISIT_BUDGET,
+            timeout=A11Y_TIMEOUT_SEC,
+        )
+        if snapshot.unavailable_reason:
+            return f"Accessibility context unavailable: {snapshot.unavailable_reason}."
+
+        prefix = "Accessibility matches" if query.strip() else "Accessibility context"
+        title = snapshot.window_title or "<untitled>"
+        lines = [
+            f"{prefix}: controls visible in the current screenshot; "
+            f"active window {snapshot.app!r} title={title!r}"
+        ]
+        formatted = [
+            line
+            for node in sorted(snapshot.nodes, key=self._a11y_node_rank)
+            if (line := self._format_a11y_node(node))
+        ]
+        if not formatted:
+            if query.strip():
+                lines.append(f"  no matching controls for {query!r}")
+            else:
+                lines.append("  no visible labeled controls found")
+        else:
+            lines.extend(formatted)
+        if snapshot.truncated:
+            lines.append("  [truncated]")
+        return "\n".join(lines)
+
+    def _format_a11y_node(self, node: "AccessibilityNode") -> str:
+        visible_rect = self._mapper.scale.visible_api_rect(
+            node.x,
+            node.y,
+            node.width,
+            node.height,
+        )
+        if visible_rect is None:
+            return ""
+        rect_x, rect_y, rect_w, rect_h = visible_rect
+        cx = rect_x + rect_w // 2
+        cy = rect_y + rect_h // 2
+
+        label = node.label or node.value or node.description or "<unlabeled>"
+        label = label.replace("\n", " ")[:80]
+        suffix_parts = [*node.states, *node.actions]
+        suffix = f" {' '.join(suffix_parts)}" if suffix_parts else ""
+        return (
+            f"  [{node.id}] {node.role} {label!r} "
+            f"center=({cx},{cy}) rect=({rect_x},{rect_y},{rect_w},{rect_h}){suffix}"
+        )
+
+    @staticmethod
+    def _a11y_node_rank(node: "AccessibilityNode") -> tuple[int, int, int, int, str]:
+        role = node.role.lower()
+        actions = set(node.actions)
+        states = set(node.states)
+        area = node.width * node.height
+
+        if "press" in actions:
+            bucket = 0
+        elif "set_text" in actions or "focus" in actions:
+            bucket = 1
+        elif states.intersection({"focused", "selected", "expanded"}):
+            bucket = 2
+        elif any(part in role for part in ("row", "cell", "item", "outline", "list")):
+            bucket = 3
+        elif any(part in role for part in ("statictext", "text")):
+            bucket = 4
+        elif any(part in role for part in ("window", "group", "scrollarea", "toolbar")):
+            bucket = 5
+        else:
+            bucket = 4
+
+        label = node.label or node.value or node.description
+        return (bucket, area, node.depth, int(node.id), label.lower())
+
     def _coord_result(
         self, base_text: str, ix: int, iy: int, include_screenshot: bool,
     ) -> ActionResult:
@@ -344,7 +445,7 @@ class ActionExecutor:
         if not include_screenshot:
             return ActionResult(text=base_text)
         ss = self.take_screenshot()
-        context = self._screenshot_context_text()
+        context = self._observation_context_text()
         crop = self.detail_crop(ix, iy)
         caption: str | None = None
         if crop is not None:
@@ -400,7 +501,7 @@ class ActionExecutor:
         call fails; callers wrap with their own error-format conventions.
         """
         if name == "screenshot":
-            return self.screenshot()
+            return self.screenshot(query=str(args.get("query", "")))
         if name == "left_click":
             return await self.left_click(
                 _safe_int(args["x"]), _safe_int(args["y"]),
@@ -512,10 +613,21 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
     ToolSpec(
         name="screenshot",
         description=(
-            "Take a screenshot of the current screen. Returns the image. "
-            "Call this first to see what's on screen before acting."
+            "Take a screenshot of the current screen. Returns the image plus "
+            "compact accessibility context when available. Call this first to "
+            "see what's on screen before acting. Optionally pass query to "
+            "retrieve matching on-screen controls from the current window."
         ),
-        input_schema={"type": "object", "properties": {}, "required": []},
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Optional text to retrieve matching controls",
+                },
+            },
+            "required": [],
+        },
     ),
     ToolSpec(
         name="left_click",

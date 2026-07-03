@@ -6,6 +6,7 @@ from click.testing import CliRunner
 
 from protean.agent_setup import (
     AgentTarget,
+    _mcp_command_args,
     copy_skill_dirs,
     inject_instructions,
     inject_mcp_config,
@@ -376,9 +377,10 @@ def test_inject_mcp_config_toml_creates_file(tmp_path: Path):
     path = inject_mcp_config(target)
     assert path == target.mcp_config_file
     doc = tomllib.loads(path.read_text(encoding="utf-8"))
+    expected_cmd, expected_args = _mcp_command_args()
     assert doc["mcp_servers"]["protean"] == {
-        "command": "protean",
-        "args": ["mcp"],
+        "command": expected_cmd,
+        "args": expected_args,
     }
 
 
@@ -400,7 +402,7 @@ def test_inject_mcp_config_toml_replaces_only_protean_entry(tmp_path: Path):
 
     text = target.mcp_config_file.read_text(encoding="utf-8")
     doc = tomllib.loads(text)
-    assert doc["mcp_servers"]["protean"]["command"] == "protean"
+    assert doc["mcp_servers"]["protean"]["command"] == _mcp_command_args()[0]
     assert doc["model"] == "gpt-5"  # user content preserved
     assert doc["other"]["section"]["key"] == 1  # sibling table preserved
 
@@ -427,7 +429,7 @@ def test_inject_mcp_config_toml_preserves_sibling_mcp_servers(tmp_path: Path):
     inject_mcp_config(target)
 
     doc = tomllib.loads(target.mcp_config_file.read_text(encoding="utf-8"))
-    assert doc["mcp_servers"]["protean"]["command"] == "protean"
+    assert doc["mcp_servers"]["protean"]["command"] == _mcp_command_args()[0]
     assert doc["mcp_servers"]["node_repl"]["command"].endswith("node_repl")
     assert doc["mcp_servers"]["node_repl"]["env"]["NODE_REPL_FOO"] == "bar"
 
@@ -446,10 +448,11 @@ def test_inject_mcp_config_json_creates_file(tmp_path: Path):
     assert path == target.mcp_config_file
     import json
     data = json.loads(path.read_text(encoding="utf-8"))
+    expected_cmd, expected_args = _mcp_command_args()
     assert data["mcpServers"]["protean"] == {
         "type": "stdio",
-        "command": "protean",
-        "args": ["mcp"],
+        "command": expected_cmd,
+        "args": expected_args,
         "env": {},
     }
 
@@ -467,7 +470,7 @@ def test_inject_mcp_config_json_preserves_other_keys(tmp_path: Path):
     data = json.loads(target.mcp_config_file.read_text(encoding="utf-8"))
     assert data["numStartups"] == 7
     assert data["mcpServers"]["other"] == {"command": "x"}
-    assert data["mcpServers"]["protean"]["command"] == "protean"
+    assert data["mcpServers"]["protean"]["command"] == _mcp_command_args()[0]
 
 
 def test_remove_mcp_config_toml_preserves_surrounding_content(tmp_path: Path):

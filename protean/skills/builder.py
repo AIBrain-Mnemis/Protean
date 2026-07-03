@@ -32,7 +32,6 @@ from protean.skills.prompts import (
     REFINE_PROMPT,
 )
 from protean.skills.schema import Skill, SkillParameter, Step, to_kebab
-from protean.skills.toolkit import get_toolkit_prompt
 
 log = logging.getLogger(__name__)
 
@@ -893,7 +892,7 @@ class SkillBuilder:
                 messages: list[dict] = [
                     {
                         "role": "system",
-                        "content": RECORDING_SYSTEM_PROMPT + "\n" + get_toolkit_prompt(),
+                        "content": RECORDING_SYSTEM_PROMPT,
                     },
                     {"role": "user", "content": content_parts},
                 ]

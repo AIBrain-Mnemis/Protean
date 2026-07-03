@@ -1,5 +1,6 @@
 """Prompt for creating a new skill from an autonomous agent's trajectory."""
 
+from protean.skills.prompts.skill_authoring_rules import SKILL_AUTHORING_RULES
 from protean.skills.prompts.step_field_rules import STEP_FIELD_RULES
 
 CREATE_FROM_TRAJECTORY_PROMPT = """\
@@ -19,7 +20,7 @@ parameters or as schematic placeholders. The resulting skill should read as if
 it could run on any equivalent input next week, not as a log of what happened
 today.
 
-""" + STEP_FIELD_RULES + """
+""" + SKILL_AUTHORING_RULES + STEP_FIELD_RULES + """
 ## Task context
 
 {task_context}

@@ -88,7 +88,16 @@ from Quartz import (
     kCGWindowListOptionOnScreenOnly,
 )
 
-from protean.platform.base import ClipboardContent, DisplayInfo, ElementInfo, Platform, WindowInfo
+from protean.platform.base import (
+    AccessibilityNode,
+    AccessibilitySnapshot,
+    ClipboardContent,
+    DisplayInfo,
+    ElementInfo,
+    Platform,
+    Rect,
+    WindowInfo,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1244,6 +1253,215 @@ class MacOSPlatform(Platform):
             return None
         _, role = AXUIElementCopyAttributeValue(el, "AXRole", None)
         return str(role) if role else None
+
+    def accessibility_snapshot(
+        self,
+        query: str = "",
+        *,
+        app: str = "",
+        visible_bounds: Rect | None = None,
+        max_nodes: int,
+        max_visited: int,
+        timeout: float,
+    ) -> AccessibilitySnapshot:
+        requested_app = app.strip()
+        if requested_app:
+            pid = self._find_app_pid(requested_app)
+            if pid is None:
+                return AccessibilitySnapshot(
+                    app=requested_app,
+                    unavailable_reason=f"application is not running: {requested_app}",
+                )
+            app_name = self._find_process_name(requested_app) or requested_app
+            window_title = ""
+        else:
+            window = self.get_active_window()
+            if window is None:
+                return AccessibilitySnapshot(unavailable_reason="no active window")
+            pid = window.pid
+            app_name = window.process_name
+            window_title = window.window_title
+
+        if pid is None:
+            return AccessibilitySnapshot(unavailable_reason="no active window")
+
+        app_ref = AXUIElementCreateApplication(pid)
+        try:
+            AXUIElementSetAttributeValue(app_ref, "AXEnhancedUserInterface", True)
+        except Exception:
+            pass
+
+        roots: list[object] = []
+        try:
+            err, focused = AXUIElementCopyAttributeValue(app_ref, "AXFocusedWindow", None)
+            if err == 0 and focused is not None:
+                roots.append(focused)
+        except Exception:
+            pass
+        if not roots:
+            try:
+                err, wins = AXUIElementCopyAttributeValue(app_ref, "AXWindows", None)
+                if err == 0 and wins:
+                    roots.extend(wins)
+            except Exception:
+                pass
+        if not roots:
+            roots.append(app_ref)
+
+        skip_roles = {"AXMenuBar", "AXMenu"}
+        default_roles = {
+            "AXButton", "AXTextField", "AXTextArea", "AXCheckBox", "AXRadioButton",
+            "AXPopUpButton", "AXComboBox", "AXSlider", "AXMenuItem", "AXMenuBarItem",
+            "AXLink", "AXTab", "AXTabGroup", "AXToolbar",
+        }
+        label_attrs = ("AXTitle", "AXDescription", "AXValue", "AXPlaceholderValue")
+        query_lower = query.lower().strip()
+        deadline = time.monotonic() + timeout
+        max_depth = 25
+        nodes: list[AccessibilityNode] = []
+        seen: set[tuple[str, str, int, int, int, int]] = set()
+        node_index = 1
+        visited = 0
+        truncated = False
+        stack: list[tuple[object, int]] = [(root, 0) for root in roots]
+
+        def _attr(node: object, name: str) -> object | None:
+            try:
+                err, val = AXUIElementCopyAttributeValue(node, name, None)
+            except Exception:
+                return None
+            return val if err == 0 and val is not None else None
+
+        def _text(node: object, name: str, limit: int = 120) -> str:
+            val = _attr(node, name)
+            if val is None:
+                return ""
+            text = str(val).strip()
+            return text[:limit]
+
+        def _flag(node: object, name: str) -> bool:
+            val = _attr(node, name)
+            return bool(val) if val is not None else False
+
+        while stack:
+            if time.monotonic() > deadline:
+                truncated = True
+                break
+            visited += 1
+            if visited > max_visited:
+                truncated = True
+                break
+            raw, depth = stack.pop()
+            if depth > max_depth:
+                truncated = True
+                continue
+
+            role = _text(raw, "AXRole", 80)
+            if role in skip_roles:
+                continue
+
+            pos_val = _attr(raw, "AXPosition")
+            size_val = _attr(raw, "AXSize")
+            px, py = _extract_ax_point(pos_val) if pos_val is not None else (None, None)
+            width, height = _extract_ax_size(size_val) if size_val is not None else (None, None)
+            rect: Rect | None = None
+            if px is not None and py is not None and width is not None and height is not None:
+                rect = Rect(int(px), int(py), int(width), int(height))
+
+            visible = visible_bounds is None or rect is None or rect.intersects(visible_bounds)
+
+            label = ""
+            value = ""
+            description = ""
+            query_hit = False
+            for attr in label_attrs:
+                text = _text(raw, attr)
+                if not text:
+                    continue
+                if attr == "AXValue":
+                    value = text
+                elif attr == "AXDescription":
+                    description = text
+                if not label:
+                    label = text
+                if query_lower and query_lower in text.lower():
+                    query_hit = True
+                    break
+
+            query_matches = not query_lower or query_hit or query_lower in role.lower()
+
+            states: list[str] = []
+            if _flag(raw, "AXEnabled"):
+                states.append("enabled")
+            if _flag(raw, "AXFocused"):
+                states.append("focused")
+            if _flag(raw, "AXSelected"):
+                states.append("selected")
+            if _flag(raw, "AXExpanded"):
+                states.append("expanded")
+
+            include_default = role in default_roles or any(
+                state in states for state in ("focused", "selected", "expanded")
+            )
+            if (
+                query_matches
+                and visible
+                and (query_lower or include_default)
+                and rect is not None
+                and rect.width >= 5
+                and rect.height >= 5
+                and (label or value or description)
+            ):
+                x = rect.x
+                y = rect.y
+                w = rect.width
+                h = rect.height
+                key = (role, label or value or description, x, y, w, h)
+                if key not in seen:
+                    actions: list[str] = []
+                    if role in {
+                        "AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton",
+                        "AXMenuItem", "AXMenuBarItem", "AXLink", "AXTab",
+                    }:
+                        actions.append("press")
+                    if role in {"AXTextField", "AXTextArea", "AXComboBox"}:
+                        actions.extend(["focus", "set_text"])
+
+                    seen.add(key)
+                    nodes.append(AccessibilityNode(
+                        id=str(node_index),
+                        role=role,
+                        raw_role=role,
+                        label=label,
+                        value=value,
+                        description=description,
+                        x=x,
+                        y=y,
+                        width=w,
+                        height=h,
+                        depth=depth,
+                        states=tuple(states),
+                        actions=tuple(actions),
+                    ))
+                    node_index += 1
+                    if len(nodes) >= max_nodes:
+                        truncated = bool(stack)
+                        break
+
+            try:
+                err, children = AXUIElementCopyAttributeValue(raw, "AXChildren", None)
+            except Exception:
+                continue
+            if err == 0 and children:
+                for i in range(len(children) - 1, -1, -1):
+                    stack.append((children[i], depth + 1))
+
+        return AccessibilitySnapshot(
+            app=app_name,
+            window_title=window_title,
+            nodes=nodes,
+            truncated=truncated,
+        )
 
     def element_at(self, x: int, y: int) -> ElementInfo | None:
         """Get the accessibility element at global screen coordinates.

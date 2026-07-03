@@ -289,15 +289,19 @@ class EvolveAction(BaseModel):
         description=(
             "The focused library change this action should make. For create, "
             "state the target reusable capability to author. For refine, state "
-            "the intended update to the existing skill. For delete, state what "
-            "should be removed or deprecated."
+            "the concrete behavior to add to the existing skill and the output "
+            "check that proves it. For delete, state what should be removed "
+            "or deprecated."
         ),
     )
     observed_gap: str = Field(
         default="",
         description=(
             "What the current skill library lacks, or what the existing target "
-            "skill got wrong or left underspecified."
+            "skill got wrong or left underspecified. For failed runs, include "
+            "the likely failure mechanism or validation blind spot inferred "
+            "from the instruction, attempted workflow, output, logs, and "
+            "verification result."
         ),
     )
     evidence: list[str] = Field(

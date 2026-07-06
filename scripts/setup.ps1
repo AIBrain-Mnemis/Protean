@@ -83,6 +83,55 @@ function Env-Set {
 
 function Test-Cmd { param($Name) [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
 
+function Add-PathEntry {
+    param([string]$Dir, [switch]$PersistUser)
+    if (-not $Dir -or -not (Test-Path $Dir)) { return }
+
+    $pathParts = $env:PATH -split ';' | Where-Object { $_ }
+    if ($pathParts -notcontains $Dir) {
+        $env:PATH = "$Dir;$env:PATH"
+    }
+
+    if ($PersistUser) {
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $userParts = $userPath -split ';' | Where-Object { $_ }
+        if ($userParts -notcontains $Dir) {
+            $newUserPath = if ($userPath) { "$userPath;$Dir" } else { $Dir }
+            [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
+            Write-Warn "added $Dir to User PATH - open a new shell for future sessions"
+        }
+    }
+}
+
+function Refresh-SessionPath {
+    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $parts = @($env:PATH, $machinePath, $userPath) -join ';'
+    $deduped = $parts -split ';' | Where-Object { $_ } | Select-Object -Unique
+    if ($deduped) { $env:PATH = $deduped -join ';' }
+}
+
+function Resolve-FfmpegBin {
+    $roots = @(
+        (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'),
+        (Join-Path $env:USERPROFILE 'Tools'),
+        $env:ProgramFiles,
+        ${env:ProgramFiles(x86)},
+        'C:\ffmpeg'
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    foreach ($root in $roots) {
+        $ffmpeg = Get-ChildItem -Path $root -Filter 'ffmpeg.exe' -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($ffmpeg) {
+            $bin = Split-Path $ffmpeg.FullName
+            if (Test-Path (Join-Path $bin 'ffprobe.exe')) { return $bin }
+        }
+    }
+
+    return $null
+}
+
 function Test-ProteanRepo {
     param([string]$Dir)
     if (-not $Dir -or -not (Test-Path (Join-Path $Dir 'pyproject.toml'))) { return $false }
@@ -191,11 +240,20 @@ if (Test-Path .env) {
 
 # ---------- ffmpeg -------------------------------------------------------
 Write-Step "Check ffmpeg (provides ffmpeg + ffprobe)"
+Refresh-SessionPath
+$ffmpegBin = $null
+if (-not ((Test-Cmd 'ffmpeg') -and (Test-Cmd 'ffprobe'))) {
+    $ffmpegBin = Resolve-FfmpegBin
+    if ($ffmpegBin) { Add-PathEntry $ffmpegBin -PersistUser }
+}
+
 if ((Test-Cmd 'ffmpeg') -and (Test-Cmd 'ffprobe')) {
+    if ($ffmpegBin) { Write-Info "found ffmpeg tools at $ffmpegBin" }
     Write-Pass "ffmpeg + ffprobe present"
 } else {
     Write-Fail "ffmpeg / ffprobe missing"
     Write-Info "Install: winget install Gyan.FFmpeg  (or: choco install ffmpeg)"
+    Write-Info "If winget says it is already installed, reopen PowerShell or add the package's bin directory to PATH"
 }
 
 # ---------- node ---------------------------------------------------------

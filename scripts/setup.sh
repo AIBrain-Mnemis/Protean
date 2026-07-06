@@ -110,6 +110,68 @@ env_set() {
   mv "$tmp" .env
 }
 
+add_path_entry() {
+  local dir="$1"
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) PATH="$dir:$PATH"; export PATH ;;
+  esac
+}
+
+windows_path_to_unix() {
+  local p="$1"
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -u "$p" 2>/dev/null || printf "%s" "$p"
+  else
+    printf "%s" "$p"
+  fi
+}
+
+find_ffmpeg_bin() {
+  local dir root found
+  for dir in \
+    /opt/homebrew/bin \
+    /usr/local/bin \
+    /opt/local/bin \
+    /usr/bin \
+    /snap/bin \
+    "$HOME/.local/bin" \
+    "$HOME/Tools/ffmpeg/bin" \
+    /c/ffmpeg/bin
+  do
+    if { [ -x "$dir/ffmpeg" ] || [ -x "$dir/ffmpeg.exe" ]; } && \
+       { [ -x "$dir/ffprobe" ] || [ -x "$dir/ffprobe.exe" ]; }; then
+      printf "%s" "$dir"
+      return 0
+    fi
+  done
+
+  case "$OS" in
+    MINGW*|MSYS*|CYGWIN*)
+      for root in \
+        "${LOCALAPPDATA:-}/Microsoft/WinGet/Packages" \
+        "${USERPROFILE:-}/Tools" \
+        "C:/ffmpeg" \
+        "C:/Program Files" \
+        "C:/Program Files (x86)"
+      do
+        [ -n "$root" ] || continue
+        root="$(windows_path_to_unix "$root")"
+        [ -d "$root" ] || continue
+        found="$(find "$root" -type f -name ffmpeg.exe -print -quit 2>/dev/null || true)"
+        [ -n "$found" ] || continue
+        dir="$(dirname "$found")"
+        [ -x "$dir/ffprobe.exe" ] || continue
+        printf "%s" "$dir"
+        return 0
+      done
+      ;;
+  esac
+
+  return 1
+}
+
 # ---------- locate or clone repo ----------------------------------------
 # A "protean repo" is a directory whose pyproject.toml declares name="protean".
 # When the script lives inside such a repo (normal case: user already cloned),
@@ -224,6 +286,14 @@ fi
 
 # ---------- ffmpeg -------------------------------------------------------
 step "Check ffmpeg (provides ffmpeg + ffprobe)"
+if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+  ffmpeg_bin="$(find_ffmpeg_bin || true)"
+  if [ -n "$ffmpeg_bin" ]; then
+    add_path_entry "$ffmpeg_bin"
+    info "found ffmpeg tools at $ffmpeg_bin"
+  fi
+fi
+
 if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
   pass "ffmpeg + ffprobe present"
 else
@@ -231,6 +301,7 @@ else
   case "$OS" in
     Darwin)  info "Install: brew install ffmpeg" ;;
     Linux)   info "Install: sudo apt install ffmpeg  (or distro equivalent)" ;;
+    MINGW*|MSYS*|CYGWIN*) info "Install: winget install Gyan.FFmpeg  (or add its bin directory to PATH)" ;;
     *)       info "Install ffmpeg for your platform" ;;
   esac
 fi

@@ -597,6 +597,20 @@ class ToolSpec:
         }
 
 
+# Shared opt-out flag for batched, independent tool calls issued in the same
+# turn (MCP hosts like Codex / Claude Code CLI, and any other tool-calling
+# client wired directly to this schema). ComputerUseExecutor ignores it and
+# decides screenshot inclusion itself (see is_last_tool in its agentic loop).
+_INCLUDE_SCREENSHOT_PROP: dict[str, Any] = {
+    "type": "boolean",
+    "description": (
+        "Set to false when this call is one of several independent actions "
+        "you are issuing in the same turn and it is NOT the last one — "
+        "skips the screenshot in the result to save tokens. Default true."
+    ),
+}
+
+
 def _coord_schema(x_desc: str, y_desc: str) -> dict[str, Any]:
     """Helper: JSON schema for an (x, y) coordinate pair."""
     return {
@@ -604,6 +618,7 @@ def _coord_schema(x_desc: str, y_desc: str) -> dict[str, Any]:
         "properties": {
             "x": {"type": "integer", "description": x_desc},
             "y": {"type": "integer", "description": y_desc},
+            "include_screenshot": _INCLUDE_SCREENSHOT_PROP,
         },
         "required": ["x", "y"],
     }
@@ -668,6 +683,7 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "Text to type"},
+                "include_screenshot": _INCLUDE_SCREENSHOT_PROP,
             },
             "required": ["text"],
         },
@@ -687,6 +703,7 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
                     "type": "string",
                     "description": "Key or combo, e.g. 'return', 'cmd+c', 'alt+tab'",
                 },
+                "include_screenshot": _INCLUDE_SCREENSHOT_PROP,
             },
             "required": ["keys"],
         },
@@ -711,6 +728,7 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
                     "type": "integer",
                     "description": "Number of scroll steps (default 3)",
                 },
+                "include_screenshot": _INCLUDE_SCREENSHOT_PROP,
             },
             "required": ["x", "y", "direction"],
         },
@@ -725,6 +743,7 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
                     "type": "number",
                     "description": "Seconds to wait (default 2)",
                 },
+                "include_screenshot": _INCLUDE_SCREENSHOT_PROP,
             },
             "required": [],
         },
@@ -743,6 +762,7 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
                     "type": "string",
                     "description": "Application name, process name, or bundle ID",
                 },
+                "include_screenshot": _INCLUDE_SCREENSHOT_PROP,
             },
             "required": ["app"],
         },

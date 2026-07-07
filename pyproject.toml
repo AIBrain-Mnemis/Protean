@@ -76,5 +76,12 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 
+[tool.ruff.lint.per-file-ignores]
+# Prompt strings read as continuous prose by the model — wrapping them to
+# fit line-length would inject stray newlines into the literal text sent
+# to the LLM, so long lines are expected and intentional here. Applies to
+# every "prompts" package in the repo (executor + skills), not just one.
+"**/prompts/*.py" = ["E501"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

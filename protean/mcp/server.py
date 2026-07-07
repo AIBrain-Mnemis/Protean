@@ -140,7 +140,14 @@ def _register_gui_tool(actions: ActionExecutor, spec: ToolSpec) -> Any:
     @tool(spec.name, spec.description, _spec_to_annotated_schema(spec))
     async def handler(args: dict[str, Any]) -> dict[str, Any]:
         try:
-            return result_to_mcp(await actions.dispatch(spec.name, args))
+            # ``include_screenshot`` is a batching hint from the calling
+            # agent (see GUI_TOOL_SPECS), not a Platform action arg — pull
+            # it out before dispatch instead of leaving it in the payload.
+            include_screenshot = bool(args.pop("include_screenshot", True))
+            result = await actions.dispatch(
+                spec.name, args, include_screenshot=include_screenshot,
+            )
+            return result_to_mcp(result)
         except Exception as e:
             return _error(f"{spec.name} failed: {e}")
 

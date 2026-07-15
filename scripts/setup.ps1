@@ -1,4 +1,4 @@
-# All-in-one setup for Protean (Windows / PowerShell).
+﻿# All-in-one setup for Protean (Windows / PowerShell).
 #
 # Idempotent: every step checks before it acts, so re-running is safe.
 # Each step prints PASS / SKIP / FAIL; exit code is 1 if any required step
@@ -168,10 +168,10 @@ Write-Step "Install 'protean' command shim"
 $ShimDir  = Join-Path $env:USERPROFILE '.local\bin'
 $ShimPath = Join-Path $ShimDir 'protean.cmd'
 New-Item -ItemType Directory -Force -Path $ShimDir | Out-Null
-@"
-@echo off
-uv --directory "$RepoRoot" run protean %*
-"@ | Set-Content -Path $ShimPath -Encoding ASCII
+Set-Content -Path $ShimPath -Encoding ASCII -Value @(
+    '@echo off',
+    "uv --directory ""$RepoRoot"" run protean %*"
+)
 Write-Pass "installed $ShimPath -> protean (at $RepoRoot)"
 $pathDirs = $env:PATH -split ';'
 if ($pathDirs -notcontains $ShimDir) {
@@ -231,13 +231,13 @@ if (-not (Test-Path electron-bridge)) {
         try {
             if (-not (Test-Path node_modules)) {
                 Write-Info "npm install ..."
-                & npm install --silent
+                & npm.cmd install --silent
                 if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
             } else {
                 Write-Info "node_modules present, skipping npm install"
             }
             Write-Info "npm run build ..."
-            & npm run build --silent
+            & npm.cmd run build --silent
             if ($LASTEXITCODE -ne 0) { throw "npm run build failed" }
             Write-Pass "electron-bridge built"
         } catch {
@@ -260,15 +260,17 @@ function Wire-Agent {
 }
 
 if (-not (Test-Cmd 'uv')) {
-    Write-Skip "uv missing — cannot run 'protean agents setup'"
+    Write-Skip "uv missing - cannot run 'protean agents setup'"
 } elseif (-not (Test-Path '.venv\Scripts\protean.exe')) {
-    Write-Skip ".venv\Scripts\protean.exe missing — uv sync failed?"
+    Write-Skip ".venv\Scripts\protean.exe missing - uv sync failed?"
 } else {
     Write-Info "Skips an agent automatically when its home directory is absent."
     $userProfile = $env:USERPROFILE
+    $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $userProfile '.codex' }
+    $claudeHome = if ($env:CLAUDE_HOME) { $env:CLAUDE_HOME } else { Join-Path $userProfile '.claude' }
     $candidates = @(
-        @{ Kind = 'codex';       Label = 'Codex';       Home = if ($env:CODEX_HOME)  { $env:CODEX_HOME }  else { Join-Path $userProfile '.codex' } },
-        @{ Kind = 'claude_code'; Label = 'Claude Code'; Home = if ($env:CLAUDE_HOME) { $env:CLAUDE_HOME } else { Join-Path $userProfile '.claude' } }
+        @{ Kind = 'codex';       Label = 'Codex';       Home = $codexHome },
+        @{ Kind = 'claude_code'; Label = 'Claude Code'; Home = $claudeHome }
     )
     foreach ($c in $candidates) {
         if (-not (Test-Path $c.Home)) {

@@ -71,13 +71,17 @@ from Quartz import (
     kCGEventFlagMaskShift,
     kCGEventKeyDown,
     kCGEventLeftMouseDown,
+    kCGEventLeftMouseDragged,
     kCGEventLeftMouseUp,
     kCGEventMouseMoved,
+    kCGEventOtherMouseDown,
+    kCGEventOtherMouseUp,
     kCGEventRightMouseDown,
     kCGEventRightMouseUp,
     kCGHeadInsertEventTap,
     kCGHIDEventTap,
     kCGKeyboardEventKeycode,
+    kCGMouseButtonCenter,
     kCGMouseButtonLeft,
     kCGMouseButtonRight,
     kCGMouseEventClickState,
@@ -94,8 +98,10 @@ from protean.platform.base import (
     ClipboardContent,
     DisplayInfo,
     ElementInfo,
+    MouseButton,
     Platform,
     Rect,
+    ScrollDirection,
     WindowInfo,
 )
 
@@ -536,44 +542,62 @@ class MacOSPlatform(Platform):
 
     # ── Input simulation ─────────────────────────────────
 
-    def click(self, x: int, y: int, button: str = "left") -> None:
+    def click(
+        self, x: int, y: int, button: MouseButton = "left", click_count: int = 1,
+    ) -> None:
         point = CGPointMake(x, y)
         if button == "right":
-            down = CGEventCreateMouseEvent(
-                None, kCGEventRightMouseDown, point, kCGMouseButtonRight,
+            down_type, up_type, button_const = (
+                kCGEventRightMouseDown, kCGEventRightMouseUp, kCGMouseButtonRight,
             )
-            up = CGEventCreateMouseEvent(
-                None, kCGEventRightMouseUp, point, kCGMouseButtonRight,
+        elif button == "middle":
+            down_type, up_type, button_const = (
+                kCGEventOtherMouseDown, kCGEventOtherMouseUp, kCGMouseButtonCenter,
             )
         else:
-            down = CGEventCreateMouseEvent(
-                None, kCGEventLeftMouseDown, point, kCGMouseButtonLeft,
+            down_type, up_type, button_const = (
+                kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGMouseButtonLeft,
             )
-            up = CGEventCreateMouseEvent(
-                None, kCGEventLeftMouseUp, point, kCGMouseButtonLeft,
-            )
+        for click_state in range(1, click_count + 1):
+            down = CGEventCreateMouseEvent(None, down_type, point, button_const)
+            CGEventSetIntegerValueField(down, kCGMouseEventClickState, click_state)
+            up = CGEventCreateMouseEvent(None, up_type, point, button_const)
+            CGEventSetIntegerValueField(up, kCGMouseEventClickState, click_state)
+            CGEventPost(kCGHIDEventTap, down)
+            CGEventPost(kCGHIDEventTap, up)
+
+    def drag(self, from_x: int, from_y: int, to_x: int, to_y: int) -> None:
+        """Drag from one point to another using CGEvent mouse-down/dragged/up.
+
+        Posts intermediate ``kCGEventLeftMouseDragged`` events along the
+        path so apps that track drag position (drop-target highlighting,
+        outline/table reordering) see a real gesture instead of a jump.
+        """
+        down = CGEventCreateMouseEvent(
+            None, kCGEventLeftMouseDown, CGPointMake(from_x, from_y), kCGMouseButtonLeft,
+        )
         CGEventPost(kCGHIDEventTap, down)
+        steps = 10
+        for step in range(1, steps + 1):
+            ix = from_x + (to_x - from_x) * step // steps
+            iy = from_y + (to_y - from_y) * step // steps
+            dragged = CGEventCreateMouseEvent(
+                None, kCGEventLeftMouseDragged, CGPointMake(ix, iy), kCGMouseButtonLeft,
+            )
+            CGEventPost(kCGHIDEventTap, dragged)
+            time.sleep(0.01)
+        up = CGEventCreateMouseEvent(
+            None, kCGEventLeftMouseUp, CGPointMake(to_x, to_y), kCGMouseButtonLeft,
+        )
         CGEventPost(kCGHIDEventTap, up)
 
-    def double_click(self, x: int, y: int) -> None:
-        """Double-click at (x, y) using CGEvent with clickCount=2."""
-        point = CGPointMake(x, y)
-        # First click
-        down1 = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, point, kCGMouseButtonLeft)
-        CGEventSetIntegerValueField(down1, kCGMouseEventClickState, 1)
-        up1 = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, point, kCGMouseButtonLeft)
-        CGEventSetIntegerValueField(up1, kCGMouseEventClickState, 1)
-        # Second click
-        down2 = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, point, kCGMouseButtonLeft)
-        CGEventSetIntegerValueField(down2, kCGMouseEventClickState, 2)
-        up2 = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, point, kCGMouseButtonLeft)
-        CGEventSetIntegerValueField(up2, kCGMouseEventClickState, 2)
-        CGEventPost(kCGHIDEventTap, down1)
-        CGEventPost(kCGHIDEventTap, up1)
-        CGEventPost(kCGHIDEventTap, down2)
-        CGEventPost(kCGHIDEventTap, up2)
-
-    def scroll(self, x: int, y: int, direction: str = "down", amount: int = 3) -> None:
+    def scroll(
+        self,
+        x: int,
+        y: int,
+        direction: ScrollDirection = "down",
+        amount: int = 3,
+    ) -> None:
         """Scroll at (x, y). direction: up/down/left/right."""
         # Move cursor to position first
         self.move_cursor(x, y)
@@ -583,9 +607,9 @@ class MacOSPlatform(Platform):
         elif direction == "up":
             dy = amount
         elif direction == "right":
-            dx = -amount
-        elif direction == "left":
             dx = amount
+        elif direction == "left":
+            dx = -amount
         scroll_event = CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitLine, 2, dy, dx)
         CGEventPost(kCGHIDEventTap, scroll_event)
 
@@ -1673,11 +1697,38 @@ class MacOSPlatform(Platform):
 
         return results
 
-    def activate_app(self, app: str) -> None:
+    def activate_app(self, app: str) -> WindowInfo:
         """Bring an application to the foreground via AppleScript."""
-        subprocess.run(
+        identity = subprocess.run(
+            ["osascript", "-e", f'id of application "{_escape_applescript(app)}"'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if identity.returncode != 0:
+            detail = identity.stderr.strip() or f"exit code {identity.returncode}"
+            raise RuntimeError(f"Application {app!r} could not be resolved: {detail}")
+        bundle_id = identity.stdout.strip()
+
+        result = subprocess.run(
             ["osascript", "-e", f'tell application "{_escape_applescript(app)}" to activate'],
-            capture_output=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"Application {app!r} could not be activated: {detail}")
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            window = self.get_active_window()
+            if window is not None and window.bundle_id == bundle_id:
+                return window
+            time.sleep(0.05)
+        actual = self.get_active_window()
+        raise RuntimeError(
+            f"Application {app!r} did not become active; active window is {actual}"
         )
 
     def _find_process_name(self, app_name: str) -> str | None:

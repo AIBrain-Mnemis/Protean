@@ -26,8 +26,10 @@ from protean.platform.base import (
     ClipboardContent,
     DisplayInfo,
     ElementInfo,
+    MouseButton,
     Platform,
     Rect,
+    ScrollDirection,
     WindowInfo,
 )
 
@@ -823,7 +825,9 @@ class WindowsPlatform(Platform):
 
     # ── Input simulation ─────────────────────────────────
 
-    def click(self, x: int, y: int, button: str = "left") -> None:
+    def click(
+        self, x: int, y: int, button: MouseButton = "left", click_count: int = 1,
+    ) -> None:
         ctypes.windll.user32.SetCursorPos(x, y)
         time.sleep(0.02)
 
@@ -834,19 +838,36 @@ class WindowsPlatform(Platform):
         else:
             down, up = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
 
-        _send_input(_make_mouse_input(flags=down), _make_mouse_input(flags=up))
+        for _ in range(click_count):
+            _send_input(_make_mouse_input(flags=down), _make_mouse_input(flags=up))
+            if click_count > 1:
+                time.sleep(0.05)
 
-    def double_click(self, x: int, y: int) -> None:
-        ctypes.windll.user32.SetCursorPos(x, y)
+    def drag(self, from_x: int, from_y: int, to_x: int, to_y: int) -> None:
+        """Drag from one point to another via LEFTDOWN, cursor moves, LEFTUP.
+
+        Moves the cursor through intermediate points (rather than
+        teleporting) so apps that track drag position see a real
+        gesture instead of a jump.
+        """
+        ctypes.windll.user32.SetCursorPos(from_x, from_y)
         time.sleep(0.02)
-        for _ in range(2):
-            _send_input(
-                _make_mouse_input(flags=MOUSEEVENTF_LEFTDOWN),
-                _make_mouse_input(flags=MOUSEEVENTF_LEFTUP),
-            )
-            time.sleep(0.05)
+        _send_input(_make_mouse_input(flags=MOUSEEVENTF_LEFTDOWN))
+        steps = 10
+        for step in range(1, steps + 1):
+            ix = from_x + (to_x - from_x) * step // steps
+            iy = from_y + (to_y - from_y) * step // steps
+            ctypes.windll.user32.SetCursorPos(ix, iy)
+            time.sleep(0.01)
+        _send_input(_make_mouse_input(flags=MOUSEEVENTF_LEFTUP))
 
-    def scroll(self, x: int, y: int, direction: str = "down", amount: int = 3) -> None:
+    def scroll(
+        self,
+        x: int,
+        y: int,
+        direction: ScrollDirection = "down",
+        amount: int = 3,
+    ) -> None:
         self.move_cursor(x, y)
         time.sleep(0.02)
         if direction in ("up", "down"):
@@ -2008,7 +2029,7 @@ class WindowsPlatform(Platform):
         except Exception:
             return None
 
-    def activate_app(self, app: str) -> None:
+    def activate_app(self, app: str) -> WindowInfo:
         """Bring an app to foreground using AttachThreadInput trick."""
         try:
             import win32con
@@ -2016,13 +2037,14 @@ class WindowsPlatform(Platform):
             import win32process
         except ImportError:
             try:
-                import uiautomation  # noqa: F401
                 win = self._find_app_window(app)
-                if win:
-                    win.SetFocus()
-            except Exception:
-                pass
-            return
+                if win is None:
+                    raise RuntimeError(f"Application window not found: {app!r}")
+                win.SetFocus()
+                target_hwnd = int(win.NativeWindowHandle)
+            except Exception as e:
+                raise RuntimeError(f"Application {app!r} could not be activated: {e}") from e
+            return self._wait_for_foreground_window(app, target_hwnd)
 
         target_hwnd = None
         app_lower = app.lower()
@@ -2047,7 +2069,7 @@ class WindowsPlatform(Platform):
             pass
 
         if target_hwnd is None:
-            return
+            raise RuntimeError(f"Application window not found: {app!r}")
 
         try:
             if win32gui.IsIconic(target_hwnd):
@@ -2084,11 +2106,29 @@ class WindowsPlatform(Platform):
                     except Exception:
                         pass
         except Exception as e:
-            log.debug("activate_app failed: %s", e)
-            try:
-                win32gui.SetForegroundWindow(target_hwnd)
-            except Exception:
-                pass
+            raise RuntimeError(f"Application {app!r} could not be activated: {e}") from e
+
+        return self._wait_for_foreground_window(app, target_hwnd)
+
+    def _wait_for_foreground_window(self, app: str, target_hwnd: int) -> WindowInfo:
+        user32 = ctypes.windll.user32
+        target_pid = ctypes.wintypes.DWORD()
+        user32.GetWindowThreadProcessId(target_hwnd, ctypes.byref(target_pid))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            foreground = user32.GetForegroundWindow()
+            foreground_pid = ctypes.wintypes.DWORD()
+            user32.GetWindowThreadProcessId(foreground, ctypes.byref(foreground_pid))
+            if foreground_pid.value == target_pid.value:
+                window = self.get_active_window()
+                if window is None:
+                    raise RuntimeError(f"Application {app!r} has no active window")
+                return window
+            time.sleep(0.05)
+        actual = self.get_active_window()
+        raise RuntimeError(
+            f"Application {app!r} did not become active; active window is {actual}"
+        )
 
     # ── Notifications ────────────────────────────────────
 

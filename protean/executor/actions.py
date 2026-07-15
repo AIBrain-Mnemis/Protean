@@ -2,7 +2,7 @@
 
 Both ``providers/computer_use`` (Anthropic Computer Use API) and the MCP
 stdio server in ``protean.mcp`` need the same primitives — take a
-screenshot, click at (x, y), type text, key_press, scroll, etc. — and
+screenshot, click at (x, y), drag, type text, key_press, scroll, etc. — and
 both want the same post-action behavior: append a fresh screenshot so
 the model doesn't have to make a separate screenshot call after every
 action.
@@ -14,9 +14,9 @@ provider translates ``ActionResult`` into its own wire format
 (Anthropic content blocks vs. MCP ``content`` array).
 
 Action methods deliberately do NOT catch ``Platform`` exceptions — they
-propagate so callers can format errors however their host API expects
-(``ComputerUseExecutor._format_tool_error`` for Anthropic / OpenAI,
-``"<Action> failed: {e}"`` for MCP).
+propagate so callers can wrap them with ``format_tool_error()`` (below)
+into their own wire format (Anthropic/OpenAI tool_result text vs. MCP
+error content).
 """
 
 from __future__ import annotations
@@ -30,13 +30,15 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast, get_args
 
 from PIL import Image, ImageDraw, ImageFont
 
 from protean.platform.base import (
     LLM_JPEG_QUALITY,
+    MouseButton,
     Rect,
+    ScrollDirection,
     parse_key_combo,
     prepare_screenshot_for_llm,
 )
@@ -52,6 +54,9 @@ A11Y_NODE_BUDGET = 80
 A11Y_QUERY_NODE_BUDGET = 24
 A11Y_TIMEOUT_SEC = 0.5
 A11Y_VISIT_BUDGET = 600
+
+_VALID_MOUSE_BUTTONS = get_args(MouseButton)
+_VALID_SCROLL_DIRECTIONS = get_args(ScrollDirection)
 
 
 @dataclass
@@ -99,14 +104,12 @@ class ActionExecutor:
     # ─── core capture ──────────────────────────────────────────────────
 
     def take_screenshot(self) -> str:
-        """Capture the active display, return JPEG base64 at API resolution.
+        """Capture the selected display, return JPEG base64 at API resolution.
 
-        Refreshes the coordinate mapper first so that the captured display
-        matches the scale used by subsequent ``to_actual()`` calls. Caches
-        the resized PIL image on the instance so ``detail_crop()`` can
-        zoom without re-capturing.
+        The coordinate mapper owns display selection. This method faithfully
+        captures that display without inspecting focus or changing coordinate
+        context. The resized image is cached for ``detail_crop()``.
         """
-        self._mapper.refresh()
         scale = self._mapper.scale
         tmp = Path(tempfile.gettempdir()) / f"protean_actions_{time.monotonic_ns()}.png"
         try:
@@ -189,29 +192,28 @@ class ActionExecutor:
 
     # ─── actions: mouse ────────────────────────────────────────────────
 
-    async def left_click(
-        self, ix: int, iy: int, *, include_screenshot: bool = True,
+    async def click(
+        self,
+        ix: int,
+        iy: int,
+        *,
+        button: MouseButton = "left",
+        click_count: int = 1,
+        include_screenshot: bool = True,
     ) -> ActionResult:
+        if button not in _VALID_MOUSE_BUTTONS:
+            raise ValueError(
+                f"Invalid button {button!r}; expected one of {_VALID_MOUSE_BUTTONS}"
+            )
         x, y = self._mapper.to_actual(ix, iy)
-        self._platform.click(x, y)
+        self._platform.click(x, y, button=button, click_count=click_count)
         await asyncio.sleep(0.5)
-        return self._coord_result(f"Clicked at ({ix}, {iy})", ix, iy, include_screenshot)
-
-    async def right_click(
-        self, ix: int, iy: int, *, include_screenshot: bool = True,
-    ) -> ActionResult:
-        x, y = self._mapper.to_actual(ix, iy)
-        self._platform.click(x, y, button="right")
-        await asyncio.sleep(0.5)
-        return self._coord_result(f"Right-clicked at ({ix}, {iy})", ix, iy, include_screenshot)
-
-    async def double_click(
-        self, ix: int, iy: int, *, include_screenshot: bool = True,
-    ) -> ActionResult:
-        x, y = self._mapper.to_actual(ix, iy)
-        self._platform.double_click(x, y)
-        await asyncio.sleep(0.5)
-        return self._coord_result(f"Double-clicked at ({ix}, {iy})", ix, iy, include_screenshot)
+        verb = {"left": "Clicked", "right": "Right-clicked", "middle": "Middle-clicked"}.get(
+            button, "Clicked",
+        )
+        if click_count >= 2:
+            verb = f"{verb} {click_count}x"
+        return self._coord_result(f"{verb} at ({ix}, {iy})", ix, iy, include_screenshot)
 
     async def mouse_move(
         self, ix: int, iy: int, *, include_screenshot: bool = True,
@@ -220,6 +222,42 @@ class ActionExecutor:
         self._platform.move_cursor(x, y)
         await asyncio.sleep(0.2)
         return self._coord_result(f"Moved cursor to ({ix}, {iy})", ix, iy, include_screenshot)
+
+    async def drag(
+        self,
+        from_ix: int,
+        from_iy: int,
+        to_ix: int,
+        to_iy: int,
+        *,
+        from_display: int | None = None,
+        to_display: int | None = None,
+        include_screenshot: bool = True,
+    ) -> ActionResult:
+        current_display = self._mapper.display_index
+        source = self._display(from_display) if from_display is not None else None
+        target = self._display(to_display) if to_display is not None else None
+        from_x, from_y = (
+            self._mapper.to_actual_on(source, from_ix, from_iy)
+            if source is not None
+            else self._mapper.to_actual(from_ix, from_iy)
+        )
+        to_x, to_y = (
+            self._mapper.to_actual_on(target, to_ix, to_iy)
+            if target is not None
+            else self._mapper.to_actual(to_ix, to_iy)
+        )
+        self._platform.drag(from_x, from_y, to_x, to_y)
+        if target is not None:
+            self._mapper.select_display(target)
+        await asyncio.sleep(0.5)
+        source_index = source.display_index if source is not None else current_display
+        target_index = target.display_index if target is not None else current_display
+        msg = (
+            f"Dragged from display {source_index} ({from_ix}, {from_iy}) "
+            f"to display {target_index} ({to_ix}, {to_iy})"
+        )
+        return self._coord_result(msg, to_ix, to_iy, include_screenshot)
 
     # ─── actions: keyboard ─────────────────────────────────────────────
 
@@ -250,11 +288,15 @@ class ActionExecutor:
         self,
         ix: int,
         iy: int,
-        direction: str,
+        direction: ScrollDirection,
         amount: int,
         *,
         include_screenshot: bool = True,
     ) -> ActionResult:
+        if direction not in _VALID_SCROLL_DIRECTIONS:
+            raise ValueError(f"Invalid scroll direction: {direction!r}")
+        if amount < 1:
+            raise ValueError(f"Scroll amount must be positive, got {amount}")
         x, y = self._mapper.to_actual(ix, iy)
         self._platform.scroll(x, y, direction, amount)
         await asyncio.sleep(0.3)
@@ -267,8 +309,10 @@ class ActionExecutor:
 
     # ─── screenshot ────────────────────────────────────────────────────
 
-    def screenshot(self, *, query: str = "") -> ActionResult:
-        """Take a screenshot as its own action (no text confirmation)."""
+    def screenshot(self, *, query: str = "", display: int | None = None) -> ActionResult:
+        """Take a screenshot, optionally switching to a specific display."""
+        if display is not None:
+            self._mapper.select_display(self._display(display))
         return self.screenshot_result(query=query)
 
     # ─── actions: app / window / clipboard ─────────────────────────────
@@ -276,18 +320,33 @@ class ActionExecutor:
     async def activate_app(
         self, app: str, *, include_screenshot: bool = True,
     ) -> ActionResult:
-        self._platform.activate_app(app)
+        activated = self._platform.activate_app(app)
         await asyncio.sleep(0.5)
         win = self._platform.get_active_window()
-        if win is not None:
-            self._mapper.refresh()
-            wx, wy, ww, wh = self._window_position_api(win)
-            msg = (
-                f'Activated {app}. Active window: "{win.window_title}" '
-                f"({win.process_name}) at ({wx}, {wy}) size {ww}x{wh}"
+        if win is None or win.pid != activated.pid:
+            raise RuntimeError(
+                f"Application {app!r} lost focus after activation; active window is {win}"
             )
-        else:
-            msg = f"Activated {app}"
+        if win.width > 0 and win.height > 0:
+            center_x = win.x + win.width // 2
+            center_y = win.y + win.height // 2
+            selected = next(
+                (
+                    display
+                    for display in self._platform.get_displays()
+                    if display.origin_x <= center_x < display.origin_x + display.width
+                    and display.origin_y <= center_y < display.origin_y + display.height
+                ),
+                None,
+            )
+            if selected is None:
+                raise RuntimeError(f"Active window is outside all displays: {win}")
+            self._mapper.select_display(selected)
+        wx, wy, ww, wh = self._window_position_api(win)
+        msg = (
+            f'Activated {app}. Active window: "{win.window_title}" '
+            f"({win.process_name}) at ({wx}, {wy}) size {ww}x{wh}"
+        )
         if not include_screenshot:
             return ActionResult(text=msg)
         return self.screenshot_result(msg, app=app)
@@ -296,7 +355,6 @@ class ActionExecutor:
         win = self._platform.get_active_window()
         if win is None:
             return ActionResult(text="No active window found")
-        self._mapper.refresh()
         wx, wy, ww, wh = self._window_position_api(win)
         return ActionResult(text=json.dumps(
             {
@@ -333,6 +391,19 @@ class ActionExecutor:
         return self.screenshot_result(msg)
 
     # ─── internals ────────────────────────────────────────────────────
+
+    def _display(self, display_index: int):
+        display = next(
+            (
+                item
+                for item in self._platform.get_displays()
+                if item.display_index == display_index
+            ),
+            None,
+        )
+        if display is None:
+            raise ValueError(f"Display {display_index} is not available")
+        return display
 
     def _screenshot_context_text(self) -> str:
         if self._last_img is None:
@@ -501,25 +572,33 @@ class ActionExecutor:
         call fails; callers wrap with their own error-format conventions.
         """
         if name == "screenshot":
-            return self.screenshot(query=str(args.get("query", "")))
-        if name == "left_click":
-            return await self.left_click(
-                _safe_int(args["x"]), _safe_int(args["y"]),
-                include_screenshot=include_screenshot,
+            display = args.get("display")
+            return self.screenshot(
+                query=str(args.get("query", "")),
+                display=_safe_int(display) if display is not None else None,
             )
-        if name == "right_click":
-            return await self.right_click(
+        if name == "click":
+            return await self.click(
                 _safe_int(args["x"]), _safe_int(args["y"]),
-                include_screenshot=include_screenshot,
-            )
-        if name == "double_click":
-            return await self.double_click(
-                _safe_int(args["x"]), _safe_int(args["y"]),
+                button=cast(MouseButton, str(args.get("button", "left"))),
+                click_count=_safe_int(args.get("click_count", 1)),
                 include_screenshot=include_screenshot,
             )
         if name == "mouse_move":
             return await self.mouse_move(
                 _safe_int(args["x"]), _safe_int(args["y"]),
+                include_screenshot=include_screenshot,
+            )
+        if name == "drag":
+            from_display = args.get("from_display")
+            to_display = args.get("to_display")
+            return await self.drag(
+                _safe_int(args["from_x"]), _safe_int(args["from_y"]),
+                _safe_int(args["to_x"]), _safe_int(args["to_y"]),
+                from_display=(
+                    _safe_int(from_display) if from_display is not None else None
+                ),
+                to_display=_safe_int(to_display) if to_display is not None else None,
                 include_screenshot=include_screenshot,
             )
         if name == "type_text":
@@ -534,8 +613,8 @@ class ActionExecutor:
             return await self.scroll(
                 _safe_int(args["x"]),
                 _safe_int(args["y"]),
-                args["direction"],
-                args.get("amount", 3),
+                cast(ScrollDirection, str(args["direction"])),
+                _safe_int(args.get("amount", 3)),
                 include_screenshot=include_screenshot,
             )
         if name == "wait":
@@ -597,6 +676,77 @@ class ToolSpec:
         }
 
 
+def tool_error_detail(error: Exception) -> str:
+    """Short human-readable detail for a tool-call exception.
+
+    Special-cases ``KeyError`` (missing required JSON field) since Python's
+    default ``str(KeyError("y"))`` renders as ``"'y'"`` with no context.
+    """
+    if isinstance(error, KeyError) and error.args:
+        return f"missing required field {error.args[0]!r}"
+    return str(error)
+
+
+def tool_error_hint(name: str, input_data: dict[str, Any]) -> str:
+    """Actionable hint for a tool-call error, tailored to common mistakes.
+
+    Shared between ``ComputerUseExecutor`` (native Anthropic/OpenAI loop)
+    and the MCP server so both surfaces give the model the same guidance
+    — e.g. catching a model passing "269, 959" as one field instead of
+    separate x/y integers.
+    """
+    if name in {"click", "mouse_move", "scroll"}:
+        x_value = input_data.get("x")
+        if "y" not in input_data and isinstance(x_value, str) and "," in x_value:
+            return (
+                "Pass x and y as separate integer fields, "
+                "not as a single comma-separated string, "
+                'for example {"x": 100, "y": 200}'
+            )
+        return "Pass integer x and y fields that match the tool schema"
+    if name == "drag":
+        for x_field, y_field in (("from_x", "from_y"), ("to_x", "to_y")):
+            x_value = input_data.get(x_field)
+            if (
+                y_field not in input_data
+                and isinstance(x_value, str)
+                and "," in x_value
+            ):
+                return (
+                    f"Pass {x_field} and {y_field} as separate integer fields, "
+                    "not as a single comma-separated string, "
+                    f'for example {{"{x_field}": 100, "{y_field}": 200}}'
+                )
+        return "Pass integer from_x, from_y, to_x, to_y fields that match the tool schema"
+    return "Match the tool input to the schema exactly"
+
+
+def format_tool_error(
+    name: str,
+    input_data: dict[str, Any],
+    input_schema: dict[str, Any] | None,
+    error: Exception,
+) -> str:
+    """Format a rich tool-call error: what failed, what was sent, what's expected.
+
+    Shared by ``ComputerUseExecutor._execute_tool`` (native loop) and
+    the MCP server's tool handlers so external CLI agents (Claude Code,
+    Codex, ...) get the same actionable feedback as the built-in
+    Anthropic/OpenAI computer-use loop instead of a bare exception string.
+    ``input_schema`` may be None for tools with no known schema (falls
+    back to the basic error without a schema/hint section).
+    """
+    parts = [
+        f"Error executing {name}: {tool_error_detail(error)}.",
+        f"Received input: {json.dumps(input_data, ensure_ascii=True, sort_keys=True)}.",
+    ]
+    if input_schema is not None:
+        schema_text = json.dumps(input_schema, ensure_ascii=True, sort_keys=True)
+        parts.append(f"Expected schema: {schema_text}.")
+        parts.append(f"Hint: {tool_error_hint(name, input_data)}.")
+    return " ".join(parts)
+
+
 # Shared opt-out flag for batched, independent tool calls issued in the same
 # turn (MCP hosts like Codex / Claude Code CLI, and any other tool-calling
 # client wired directly to this schema). ComputerUseExecutor ignores it and
@@ -628,44 +778,68 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
     ToolSpec(
         name="screenshot",
         description=(
-            "Take a screenshot of the current screen. Returns the image plus "
+            "Take a screenshot of the selected display. Returns the image plus "
             "compact accessibility context when available. Call this first to "
-            "see what's on screen before acting. Optionally pass query to "
-            "retrieve matching on-screen controls from the current window."
+            "see what's on screen before acting. Pass display to switch the "
+            "working display before capture. Optionally pass query to filter "
+            "the returned accessibility context by control text; query does "
+            "not search the screenshot image."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Optional text to retrieve matching controls",
+                    "description": (
+                        "Optional control text used only to filter the returned "
+                        "accessibility context; does not search the screenshot image"
+                    ),
+                },
+                "display": {
+                    "type": "integer",
+                    "description": (
+                        "Optional 1-based display index. Switches the working "
+                        "display before capture."
+                    ),
                 },
             },
             "required": [],
         },
     ),
     ToolSpec(
-        name="left_click",
+        name="click",
         description=(
-            "Click the left mouse button at the given (x, y) pixel coordinates. "
-            "Coordinates are relative to the screenshot image. The image is "
-            "1024 px wide and preserves the active display's aspect ratio; "
-            "each screenshot result states its exact size and valid ranges."
+            "Click at the given (x, y) pixel coordinates. Coordinates are "
+            "relative to the screenshot image. The image is 1024 px wide and "
+            "preserves the selected display's aspect ratio; each screenshot "
+            "result states its exact size and valid ranges. Use button to "
+            "pick 'left' (default), 'right', or 'middle'. Use click_count=2 "
+            "for a double-click (must be a single call, not two click calls)."
         ),
-        input_schema=_coord_schema(
-            "X coordinate (0-1023)",
-            "Y coordinate (0 to screenshot height - 1)",
-        ),
-    ),
-    ToolSpec(
-        name="right_click",
-        description="Right-click at the given (x, y) pixel coordinates.",
-        input_schema=_coord_schema("X coordinate", "Y coordinate"),
-    ),
-    ToolSpec(
-        name="double_click",
-        description="Double-click the left mouse button at (x, y).",
-        input_schema=_coord_schema("X coordinate", "Y coordinate"),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "description": "X coordinate (0-1023)"},
+                "y": {
+                    "type": "integer",
+                    "description": "Y coordinate (0 to screenshot height - 1)",
+                },
+                "button": {
+                    "type": "string",
+                    "enum": list(_VALID_MOUSE_BUTTONS),
+                    "description": "Mouse button to click (default 'left')",
+                },
+                "click_count": {
+                    "type": "integer",
+                    "description": (
+                        "Number of clicks at this point, e.g. 2 for "
+                        "double-click (default 1)"
+                    ),
+                },
+                "include_screenshot": _INCLUDE_SCREENSHOT_PROP,
+            },
+            "required": ["x", "y"],
+        },
     ),
     ToolSpec(
         name="mouse_move",
@@ -673,10 +847,45 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
         input_schema=_coord_schema("X coordinate", "Y coordinate"),
     ),
     ToolSpec(
+        name="drag",
+        description=(
+            "Drag the left mouse button from (from_x, from_y) to (to_x, to_y). "
+            "Each endpoint is relative to the compressed screenshot of its "
+            "display. Omit from_display and to_display for a same-display drag. "
+            "A successful cross-display drag switches the working display to "
+            "to_display and returns its screenshot."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "from_x": {"type": "integer", "description": "Starting X coordinate"},
+                "from_y": {"type": "integer", "description": "Starting Y coordinate"},
+                "to_x": {"type": "integer", "description": "Ending X coordinate"},
+                "to_y": {"type": "integer", "description": "Ending Y coordinate"},
+                "from_display": {
+                    "type": "integer",
+                    "description": (
+                        "Optional 1-based display index for the starting coordinates; "
+                        "defaults to the working display"
+                    ),
+                },
+                "to_display": {
+                    "type": "integer",
+                    "description": (
+                        "Optional 1-based display index for the ending coordinates; "
+                        "defaults to the working display"
+                    ),
+                },
+                "include_screenshot": _INCLUDE_SCREENSHOT_PROP,
+            },
+            "required": ["from_x", "from_y", "to_x", "to_y"],
+        },
+    ),
+    ToolSpec(
         name="type_text",
         description=(
             "Type the given text string. The text is typed character by character "
-            "into whatever field currently has focus. Use left_click first to focus "
+            "into whatever field currently has focus. Use click first to focus "
             "the target input field."
         ),
         input_schema={
@@ -721,11 +930,12 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
                 "y": {"type": "integer", "description": "Y coordinate to scroll at"},
                 "direction": {
                     "type": "string",
-                    "enum": ["up", "down", "left", "right"],
+                    "enum": list(_VALID_SCROLL_DIRECTIONS),
                     "description": "Scroll direction",
                 },
                 "amount": {
                     "type": "integer",
+                    "minimum": 1,
                     "description": "Number of scroll steps (default 3)",
                 },
                 "include_screenshot": _INCLUDE_SCREENSHOT_PROP,

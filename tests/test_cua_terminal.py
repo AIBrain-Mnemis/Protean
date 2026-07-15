@@ -13,11 +13,24 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from protean.executor.providers import computer_use as cu
+from protean.platform.base import DisplayInfo
 
 
 def _make_executor(enable_terminal: bool):
     """Construct a ComputerUseExecutor with create_sync_client mocked out."""
     fake_client = MagicMock()
+    platform = MagicMock()
+    platform.get_displays.return_value = [
+        DisplayInfo(
+            display_id=1,
+            display_index=1,
+            width=1920,
+            height=1080,
+            is_primary=True,
+        )
+    ]
+    platform.get_active_window.return_value = None
+    platform.get_cursor_position.return_value = (0, 0)
     with patch.object(
         cu, "create_sync_client",
         return_value=(fake_client, "claude-fake", False),
@@ -25,7 +38,7 @@ def _make_executor(enable_terminal: bool):
         return cu.ComputerUseExecutor(
             api_key="fake",
             model="claude-fake",
-            platform=MagicMock(),
+            platform=platform,
             enable_terminal=enable_terminal,
         )
 
@@ -43,7 +56,7 @@ def test_terminal_tool_absent_when_disabled() -> None:
     assert "run_terminal_command" not in ex._tools_by_name
     # Sanity: base tools still wired up.
     assert "screenshot" in ex._tools_by_name
-    assert "left_click" in ex._tools_by_name
+    assert "click" in ex._tools_by_name
 
 
 def test_default_terminal_command() -> None:

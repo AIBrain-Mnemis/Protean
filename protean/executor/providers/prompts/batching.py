@@ -15,7 +15,7 @@ Use this decision rule: if the next target is already knowable from the current 
 
 In practice this means you should usually emit multi-call batches, not single calls. If you can confidently predict 3+ consecutive actions from the current state, execute all of them in one turn.
 
-Example — a form with three fields you can already see in full: left_click(field1) -> type_text(value1) -> left_click(field2) -> type_text(value2) -> left_click(field3) -> type_text(value3) -> left_click(submit). All seven calls in one turn — nothing about the layout changes between them, so there is nothing new to observe until submit resolves.
+Example — a form with three fields you can already see in full: click(field1) -> type_text(value1) -> click(field2) -> type_text(value2) -> click(field3) -> type_text(value3) -> click(submit). All seven calls in one turn — nothing about the layout changes between them, so there is nothing new to observe until submit resolves.
 
 Insert wait between steps only when timing is the only uncertainty and the post-wait target is still fixed regardless of transient animation or debounce. A wait() does NOT make an unknown layout knowable.
 

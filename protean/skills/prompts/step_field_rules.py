@@ -20,7 +20,7 @@ For each step, produce:
     - Never invent a shortcut that doesn't exist or hasn't been verified to produce the same result. Prefer well-known, stable commands and shortcuts. When unsure, fall back to the demonstrated GUI path.
 
 - **tool**: optional Protean MCP tool hint. Pick the medium that best matches the action. May be empty, a single tool, or a short chain. Options include:
-    - GUI chain:  find_elements(app=..., query=...) -> click_at(center_x, center_y)
+    - GUI chain:  find_elements(app=..., query=...) -> click(x=center_x, y=center_y)
     - Shortcut:   activate_app(app=...) -> key_press(keys="cmd+s")
     - Shell:      run_terminal_command(command="sed -i 's/foo/bar/g' file.txt")
     - Script:     run_script(filename.py, args)
@@ -62,14 +62,14 @@ For each step, produce:
 
 ## Tool hints
 
-A step may have a single tool or a short chain (2-4 calls). Multiple actions forming one logical step can be chained, e.g. `find_elements(app=..., query="Location") -> left_click() -> type_text(text="...")`. Do not split one logical step into multiple steps just to mirror every tool call.
+A step may have a single tool or a short chain (2-4 calls). Multiple actions forming one logical step can be chained, e.g. `find_elements(app=..., query="Location") -> click() -> type_text(text="...")`. Do not split one logical step into multiple steps just to mirror every tool call.
 
 **Priority order for the `tool` field**, when more than one strategy reaches the same end state:
 
   1. `run_script(filename, args)`        — multi-line / parametrized logic
   2. `run_terminal_command(command=...)` — single verified shell command
   3. `key_press(keys=...)`               — native keyboard shortcut
-  4. `find_elements(...) -> click_at(...)` — GUI fallback
+  4. `find_elements(...) -> click(...)` — GUI fallback
 
 Pick the highest tier that reliably reaches the step's goal on the target platform.
 

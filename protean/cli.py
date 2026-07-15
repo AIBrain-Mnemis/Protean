@@ -1183,7 +1183,7 @@ def mcp(ctx: click.Context) -> None:
 
     Designed to be wired into external CLI agents (Codex, Claude Code,
     ...) via their ``mcp_servers`` config. The server exposes Platform
-    methods — screenshot, click, type_text, key_press, scroll,
+    methods — screenshot, click, drag, type_text, key_press, scroll,
     activate_app, get_active_window, get_clipboard — so the agent can
     drive the GUI through Protean's tool surface instead of shelling out.
     """

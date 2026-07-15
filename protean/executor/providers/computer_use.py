@@ -1,7 +1,7 @@
 """Computer Use executor — drives GUI via tool-calling agentic loop.
 
 The model sees screenshots as inline images and calls standard function tools
-(screenshot, left_click, type_text, key_press, scroll, etc.) to drive the GUI.
+(screenshot, click, drag, type_text, key_press, scroll, etc.) to drive the GUI.
 Each iteration: model sees screen → decides action → we execute → take screenshot → loop.
 
 This avoids the Claude Code proxy limitation where computer_20250124 tool inputs
@@ -27,6 +27,7 @@ from protean.executor.actions import (
     GUI_TOOL_SPECS,
     ActionExecutor,
     ActionResult,
+    format_tool_error,
 )
 from protean.executor.providers.prompts import (
     COMPUTER_USE_SYSTEM_PROMPT,
@@ -37,6 +38,7 @@ from protean.platform.base import (
     LLM_SCREENSHOT_HEIGHT,
     LLM_SCREENSHOT_WIDTH,
     CoordinateMapper,
+    active_display,
 )
 
 if TYPE_CHECKING:
@@ -50,7 +52,7 @@ _REASONING_TRUNCATE = 500
 
 # ── Tool definitions (standard function tools) ──────────────
 #
-# GUI actions (screenshot, click, type, etc.) come from
+# GUI actions (screenshot, click, drag, type, etc.) come from
 # ``protean.executor.actions.GUI_TOOL_SPECS`` so the Anthropic /
 # OpenAI function-tool list, the MCP server tool list, and
 # ``ActionExecutor.dispatch`` all stay in lockstep — adding a tool in
@@ -217,7 +219,7 @@ class ComputerUseExecutor(ExecutorProvider):
     """Execute GUI tasks via an agentic tool-calling loop.
 
     The model sees screenshots as inline images, and calls normal function tools
-    (screenshot, left_click, type_text, key_press, etc.) to drive the GUI.
+    (screenshot, click, drag, type_text, key_press, etc.) to drive the GUI.
     This works through any API proxy that supports standard tool calling.
 
     Usage:
@@ -293,7 +295,10 @@ class ComputerUseExecutor(ExecutorProvider):
 
         self._event_queue: asyncio.Queue[ExecutorEvent] = asyncio.Queue()
         self._loop_task: asyncio.Task | None = None
-        self._coords = CoordinateMapper(platform, display_width, display_height)
+        display = active_display(platform)
+        if display is None:
+            raise RuntimeError("No display is available")
+        self._coords = CoordinateMapper(display, display_width, display_height)
         # Shared GUI action layer — same primitives are exposed to external
         # CLI agents via protean.mcp. This is the single source of
         # truth for "post-action screenshot" + detail-crop behavior.
@@ -323,10 +328,10 @@ class ComputerUseExecutor(ExecutorProvider):
         if context_str:
             prompt = f"Context: {context_str}\n\nTask: {instruction}"
 
-        # Lock onto the active display so the first coord-taking tool call
-        # (which may run before the model's first screenshot) maps to the
-        # right monitor. ActionExecutor.take_screenshot() refreshes this on every capture.
-        self._coords.refresh()
+        display = active_display(self._platform)
+        if display is None:
+            raise RuntimeError("No display is available")
+        self._coords.select_display(display)
 
         self._cancelled = False
         self._content_blocks = content_blocks
@@ -1005,45 +1010,6 @@ class ComputerUseExecutor(ExecutorProvider):
         return "Token usage: " + " | ".join(parts)
 
     @staticmethod
-    def _format_tool_input(input_data: dict[str, Any]) -> str:
-        return json.dumps(input_data, ensure_ascii=True, sort_keys=True)
-
-    def _tool_schema_text(self, name: str) -> str:
-        tool = self._tools_by_name.get(name)
-        if not tool:
-            return ""
-        return json.dumps(tool["input_schema"], ensure_ascii=True, sort_keys=True)
-
-    @staticmethod
-    def _tool_error_detail(error: Exception) -> str:
-        if isinstance(error, KeyError) and error.args:
-            return f"missing required field {error.args[0]!r}"
-        return str(error)
-
-    def _tool_error_hint(self, name: str, input_data: dict[str, Any]) -> str:
-        if name in {"left_click", "right_click", "double_click", "mouse_move", "scroll"}:
-            x_value = input_data.get("x")
-            if "y" not in input_data and isinstance(x_value, str) and "," in x_value:
-                return (
-                    "Pass x and y as separate integer fields, "
-                    "not as a single comma-separated string, "
-                    'for example {"x": 100, "y": 200}'
-                )
-            return "Pass integer x and y fields that match the tool schema"
-        return "Match the tool input to the schema exactly"
-
-    def _format_tool_error(self, name: str, input_data: dict[str, Any], error: Exception) -> str:
-        parts = [
-            f"Error executing {name}: {self._tool_error_detail(error)}.",
-            f"Received input: {self._format_tool_input(input_data)}.",
-        ]
-        schema_text = self._tool_schema_text(name)
-        if schema_text:
-            parts.append(f"Expected schema: {schema_text}.")
-            parts.append(f"Hint: {self._tool_error_hint(name, input_data)}.")
-        return " ".join(parts)
-
-    @staticmethod
     def _result_to_anthropic(r: ActionResult) -> list[dict[str, Any]]:
         """Translate an ActionResult into Anthropic ``tool_result`` content.
 
@@ -1162,7 +1128,12 @@ class ComputerUseExecutor(ExecutorProvider):
 
         except Exception as e:
             log.error("Tool %s failed: %s", name, e, exc_info=True)
-            return ActionResult(text=self._format_tool_error(name, input_data, e))
+            # Schema lookup stays here (rather than in actions.py) because
+            # this executor's tool list includes done/terminal tools that
+            # aren't part of GUI_TOOL_SPECS.
+            tool = self._tools_by_name.get(name)
+            schema = tool["input_schema"] if tool else None
+            return ActionResult(text=format_tool_error(name, input_data, schema, e))
 
     # ── Helpers ──────────────────────────────────────────
 

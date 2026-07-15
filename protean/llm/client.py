@@ -39,6 +39,60 @@ T = TypeVar("T", bound=BaseModel)
 log = logging.getLogger(__name__)
 
 
+def _looks_like_bad_request(error: Exception) -> bool:
+    status_code = getattr(error, "status_code", None)
+    if status_code == 400:
+        return True
+    text = str(error).lower()
+    return "400 bad request" in text or "badrequest" in text
+
+
+def _looks_like_response_format_rejection(error: Exception) -> bool:
+    if not _looks_like_bad_request(error):
+        return False
+    text = str(error).lower()
+    # Some OpenAI-compatible gateways surface only a generic HTTP 400 line
+    # even when the rejected field is response_format. Context-overflow 400s
+    # are handled before this helper is called, so a single compatibility
+    # retry is the most useful behavior for opaque Bad Request responses.
+    if getattr(error, "status_code", None) == 400:
+        return True
+    if text.strip() in {"", "bad request"} or "400 bad request" in text:
+        return True
+    markers = (
+        "response_format",
+        "json_schema",
+        "json_object",
+        "schema",
+        "structured output",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _append_json_schema_hint(
+    messages: list[dict[str, Any]],
+    schema: dict[str, Any],
+) -> list[dict[str, Any]]:
+    schema_hint = (
+        "\n\nYou MUST respond with ONLY one valid JSON object, no markdown "
+        "fences and no prose. The JSON object must conform to this schema:\n"
+        f"{json.dumps(schema, ensure_ascii=False)}"
+    )
+    augmented = [m.copy() for m in messages]
+    for msg in reversed(augmented):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            msg["content"] = content + [{"type": "text", "text": schema_hint}]
+        else:
+            msg["content"] = str(content) + schema_hint
+        break
+    else:
+        augmented.append({"role": "user", "content": schema_hint})
+    return augmented
+
+
 @dataclass
 class LLMResponse:
     """Unified response from any LLM provider."""
@@ -314,23 +368,73 @@ class LLM:
                 parsed = parse_structured_text(content, response_model)
             return parsed, raw
         else:
-            # OpenAI: native structured output
+            # OpenAI-compatible Chat Completions: pass Protean's cleaned schema
+            # explicitly. The SDK's Pydantic parse helper includes internal
+            # fields such as dict[str, bytes] figure_data, which some compatible
+            # providers reject during schema validation.
+            schema = strict_json_schema(response_model)
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "skill_output",
+                    "schema": schema,
+                    "strict": True,
+                },
+            }
+
+            async def _create_chat_completion(
+                api_messages: list[dict[str, Any]],
+                mode: str,
+            ) -> Any:
+                kwargs: dict[str, Any] = {
+                    "model": use_model,
+                    "messages": api_messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+                if mode == "json_schema":
+                    kwargs["response_format"] = response_format
+                elif mode == "json_object":
+                    kwargs["response_format"] = {"type": "json_object"}
+                return await self._openai.chat.completions.create(**kwargs)
+
+            mode = "json_schema"
+            api_messages = build_openai_messages(messages)
             try:
-                resp = await self._openai.beta.chat.completions.parse(
-                    model=use_model,
-                    messages=build_openai_messages(messages),
-                    response_format=response_model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
+                resp = await _create_chat_completion(api_messages, mode)
             except Exception as e:
                 if is_context_overflow(e):
                     raise ContextOverflowError(str(e)) from e
-                raise
+                if not _looks_like_response_format_rejection(e):
+                    raise
+                log.warning(
+                    "Provider rejected json_schema response_format; "
+                    "falling back to JSON-mode schema prompt: %s",
+                    e,
+                )
+                mode = "json_object"
+                api_messages = build_openai_messages(
+                    _append_json_schema_hint(messages, schema)
+                )
+                try:
+                    resp = await _create_chat_completion(api_messages, mode)
+                except Exception as e2:
+                    if is_context_overflow(e2):
+                        raise ContextOverflowError(str(e2)) from e2
+                    if not _looks_like_response_format_rejection(e2):
+                        raise
+                    log.warning(
+                        "Provider rejected json_object response_format; "
+                        "falling back to schema prompt without response_format: %s",
+                        e2,
+                    )
+                    mode = "schema_prompt"
+                    resp = await _create_chat_completion(api_messages, mode)
             choice = resp.choices[0]
             usage = resp.usage
+            content = choice.message.content or ""
             raw = LLMResponse(
-                content=choice.message.content or "",
+                content=content,
                 model=resp.model,
                 usage={
                     "prompt_tokens": usage.prompt_tokens if usage else 0,
@@ -338,9 +442,57 @@ class LLM:
                 },
                 raw=resp,
             )
-            parsed = choice.message.parsed
-            if parsed is None:
-                raise ValueError("Structured output parsing returned None")
+            try:
+                parsed = parse_structured_text(content, response_model)
+            except (json.JSONDecodeError, ValidationError) as e:
+                log.warning(
+                    "Chat Completions returned non-JSON, retrying with reminder: %s",
+                    e,
+                )
+                retry_messages = build_openai_messages(messages) + [
+                    {"role": "assistant", "content": content or "(empty)"},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous response was not valid JSON conforming "
+                            "to the schema. Output ONLY a single JSON object that "
+                            "matches the schema, no markdown, no prose."
+                            f"\n\nSchema:\n{json.dumps(schema, ensure_ascii=False)}"
+                        ),
+                    },
+                ]
+                if mode != "json_schema":
+                    retry_messages = api_messages + [
+                        {"role": "assistant", "content": content or "(empty)"},
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous response was not valid JSON "
+                                "conforming to the schema. Output ONLY a single "
+                                "JSON object that matches the schema, no "
+                                "markdown, no prose."
+                            ),
+                        },
+                    ]
+                try:
+                    resp = await _create_chat_completion(retry_messages, mode)
+                except Exception as e2:
+                    if is_context_overflow(e2):
+                        raise ContextOverflowError(str(e2)) from e2
+                    raise
+                choice = resp.choices[0]
+                usage = resp.usage
+                content = choice.message.content or ""
+                raw = LLMResponse(
+                    content=content,
+                    model=resp.model,
+                    usage={
+                        "prompt_tokens": usage.prompt_tokens if usage else 0,
+                        "completion_tokens": usage.completion_tokens if usage else 0,
+                    },
+                    raw=resp,
+                )
+                parsed = parse_structured_text(content, response_model)
             return parsed, raw
 
     async def _complete_openai(

@@ -23,11 +23,12 @@ ScrollDirection = Literal["up", "down", "left", "right"]
 
 @dataclass(frozen=True)
 class WindowInfo:
-    """Information about the currently active window."""
+    """Information about an application window."""
 
     pid: int
     process_name: str
     window_title: str
+    window_id: str = ""
     bundle_id: str = ""  # macOS bundle identifier
     # Window geometry (logical coordinates)
     x: int = 0
@@ -159,7 +160,14 @@ class Platform(Protocol):
         ...
 
     def list_windows(self) -> list[WindowInfo]:
-        """List visible application windows."""
+        """List visible application windows that can be activated by ID."""
+        ...
+
+    def activate_window(self, window_id: str) -> WindowInfo:
+        """Focus a visible window by its platform-provided opaque ID.
+
+        The OS may also raise sibling windows from the same application.
+        """
         ...
 
     def list_notifications(self) -> list[WindowInfo]:

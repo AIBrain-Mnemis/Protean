@@ -5,8 +5,10 @@ import contextlib
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
-from protean.executor.actions import ActionExecutor, tool_error_hint
+from protean.cli import main
+from protean.executor.actions import GUI_TOOL_NAMES, ActionExecutor, tool_error_hint
 from protean.executor.providers.computer_use import ComputerUseExecutor
 from protean.platform.base import (
     LLM_SCREENSHOT_HEIGHT,
@@ -25,6 +27,7 @@ from protean.platform.base import (
 class FakePlatform:
     def __init__(self) -> None:
         self.activated_apps: list[str] = []
+        self.activated_windows: list[str] = []
         self.clicked_points: list[tuple[int, int]] = []
         self.dragged_points: list[tuple[int, int, int, int]] = []
         self.element_positions: dict[tuple[str, str], tuple[int, int]] = {
@@ -40,6 +43,7 @@ class FakePlatform:
             pid=123,
             process_name="Microsoft Teams",
             window_title="Meeting",
+            window_id="window-123",
             x=2000,
             y=100,
             width=1200,
@@ -50,7 +54,15 @@ class FakePlatform:
         return self.get_active_window()
 
     def list_windows(self) -> list[WindowInfo]:
-        return []
+        window = self.get_active_window()
+        return [window] if window is not None else []
+
+    def activate_window(self, window_id: str) -> WindowInfo:
+        self.activated_windows.append(window_id)
+        window = self.get_active_window()
+        if window is None or window.window_id != window_id:
+            raise RuntimeError(f"Window not found: {window_id}")
+        return window
 
     def list_notifications(self) -> list[WindowInfo]:
         return []
@@ -210,6 +222,40 @@ def test_activate_app_reports_active_window_in_api_coordinates():
     )
 
 
+def test_list_windows_and_activate_window_select_target_display():
+    platform = FakePlatform()
+    mapper = CoordinateMapper(
+        platform.get_displays()[0],
+        LLM_SCREENSHOT_WIDTH,
+        LLM_SCREENSHOT_HEIGHT,
+    )
+    actions = ActionExecutor(platform, mapper)
+
+    listed = asyncio.run(
+        actions.dispatch("list_windows", {}, include_screenshot=False)
+    )
+    activated = asyncio.run(
+        actions.dispatch(
+            "activate_window",
+            {"window_id": "window-123"},
+            include_screenshot=False,
+        )
+    )
+
+    assert listed.text == (
+        '[{"window_id": "window-123", "process_name": "Microsoft Teams", '
+        '"window_title": "Meeting", "pid": 123, "display": 2, '
+        '"global_x": 2000, "global_y": 100, "width": 1200, "height": 800, '
+        '"active": true}]'
+    )
+    assert platform.activated_windows == ["window-123"]
+    assert mapper.display_index == 2
+    assert activated.text == (
+        'Activated window window-123. Active window: "Meeting" '
+        '(Microsoft Teams) on display 2 at (109, 40) size 480x320'
+    )
+
+
 def test_click_maps_api_coordinates_to_active_display():
     platform = FakePlatform()
     actions = _make_actions(platform)
@@ -333,6 +379,49 @@ def test_coordinate_action_screenshot_includes_accessibility_context():
     assert result.text is not None
     assert "Accessibility context" in result.text
     assert "button 'Run'" in result.text
+
+
+def test_screenshot_reports_display_count_and_omits_offscreen_accessibility():
+    platform = FakePlatform()
+    mapper = CoordinateMapper(
+        platform.get_displays()[0],
+        LLM_SCREENSHOT_WIDTH,
+        LLM_SCREENSHOT_HEIGHT,
+    )
+    actions = ActionExecutor(platform, mapper)
+
+    result = actions.screenshot(display=1)
+
+    assert result.text is not None
+    assert "Screenshot: display 1 of 2" in result.text
+    assert "Focused window:" not in result.text
+    assert (
+        "Accessibility context unavailable: focused window is outside display 1."
+        in result.text
+    )
+
+
+def test_screenshot_reports_focused_window_on_selected_display():
+    platform = FakePlatform()
+    actions = _make_actions(platform)
+
+    result = actions.screenshot(display=2)
+
+    assert result.text is not None
+    assert "Screenshot: display 2 of 2" in result.text
+    assert "Focused window: id='window-123'" in result.text
+
+
+def test_window_tools_are_registered_for_all_gui_consumers():
+    assert {"list_windows", "activate_window"} <= GUI_TOOL_NAMES
+
+
+def test_mcp_help_lists_every_registered_gui_tool():
+    result = CliRunner().invoke(main, ["mcp", "--help"])
+
+    assert result.exit_code == 0
+    for name in GUI_TOOL_NAMES:
+        assert name in result.output
 
 
 def test_computer_use_tool_error_includes_schema_hint():

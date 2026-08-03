@@ -16,6 +16,7 @@ CORE RULES:
    - use coordinates within the stated x/y ranges for that screenshot
    - Click targets should be the visual center of UI elements
 5. Carefully read all visible text, accessibility context, and UI elements before acting.
+5.1. When an app has multiple windows or the target may be on another display, use `list_windows` and `activate_window` instead of guessing which window `activate_app` will choose.
 
 INTERACTION RULES:
 6. To type into a field, click it first to ensure focus.

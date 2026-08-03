@@ -432,6 +432,7 @@ class WindowsPlatform(Platform):
             pid=pid,
             process_name=process_name,
             window_title=title,
+            window_id=str(hwnd),
             x=left, y=top,
             width=right - left, height=bottom - top,
         )
@@ -462,6 +463,7 @@ class WindowsPlatform(Platform):
             pid=pid.value,
             process_name=_get_process_name(pid.value),
             window_title=title,
+            window_id=str(hwnd),
         )
 
     def get_window_at_point(self, x: int, y: int) -> WindowInfo | None:
@@ -514,6 +516,7 @@ class WindowsPlatform(Platform):
             pid=pid,
             process_name=_get_process_name(pid),
             window_title=title,
+            window_id=str(root),
             x=left, y=top,
             width=right - left, height=bottom - top,
         )
@@ -542,6 +545,7 @@ class WindowsPlatform(Platform):
                 pid=pid,
                 process_name=_get_process_name(pid),
                 window_title=title,
+                window_id=str(hwnd),
                 x=left, y=top,
                 width=right - left, height=bottom - top,
             ))
@@ -549,6 +553,21 @@ class WindowsPlatform(Platform):
 
         win32gui.EnumWindows(_enum_cb, None)
         return results
+
+    def activate_window(self, window_id: str) -> WindowInfo:
+        try:
+            target_hwnd = int(window_id)
+        except ValueError as error:
+            raise ValueError(f"Invalid Windows window ID: {window_id!r}") from error
+        try:
+            import win32gui
+        except ImportError as error:
+            raise RuntimeError("pywin32 is required to activate a window by ID") from error
+        if not win32gui.IsWindow(target_hwnd) or not win32gui.IsWindowVisible(target_hwnd):
+            raise RuntimeError(f"Window {window_id!r} is not visible")
+        return self._activate_window_handle(
+            target_hwnd, f"window {window_id!r}", exact=True,
+        )
 
     def list_notifications(self) -> list[WindowInfo]:
         return []
@@ -2032,7 +2051,6 @@ class WindowsPlatform(Platform):
     def activate_app(self, app: str) -> WindowInfo:
         """Bring an app to foreground using AttachThreadInput trick."""
         try:
-            import win32con
             import win32gui
             import win32process
         except ImportError:
@@ -2071,6 +2089,15 @@ class WindowsPlatform(Platform):
         if target_hwnd is None:
             raise RuntimeError(f"Application window not found: {app!r}")
 
+        return self._activate_window_handle(target_hwnd, f"application {app!r}")
+
+    def _activate_window_handle(
+        self, target_hwnd: int, target: str, *, exact: bool = False,
+    ) -> WindowInfo:
+        import win32con
+        import win32gui
+        import win32process
+
         try:
             if win32gui.IsIconic(target_hwnd):
                 win32gui.ShowWindow(target_hwnd, win32con.SW_RESTORE)
@@ -2106,11 +2133,13 @@ class WindowsPlatform(Platform):
                     except Exception:
                         pass
         except Exception as e:
-            raise RuntimeError(f"Application {app!r} could not be activated: {e}") from e
+            raise RuntimeError(f"{target.capitalize()} could not be activated: {e}") from e
 
-        return self._wait_for_foreground_window(app, target_hwnd)
+        return self._wait_for_foreground_window(target, target_hwnd, exact=exact)
 
-    def _wait_for_foreground_window(self, app: str, target_hwnd: int) -> WindowInfo:
+    def _wait_for_foreground_window(
+        self, app: str, target_hwnd: int, *, exact: bool = False,
+    ) -> WindowInfo:
         user32 = ctypes.windll.user32
         target_pid = ctypes.wintypes.DWORD()
         user32.GetWindowThreadProcessId(target_hwnd, ctypes.byref(target_pid))
@@ -2119,7 +2148,11 @@ class WindowsPlatform(Platform):
             foreground = user32.GetForegroundWindow()
             foreground_pid = ctypes.wintypes.DWORD()
             user32.GetWindowThreadProcessId(foreground, ctypes.byref(foreground_pid))
-            if foreground_pid.value == target_pid.value:
+            if (
+                foreground == target_hwnd
+                if exact
+                else foreground_pid.value == target_pid.value
+            ):
                 window = self.get_active_window()
                 if window is None:
                     raise RuntimeError(f"Application {app!r} has no active window")

@@ -327,21 +327,10 @@ class ActionExecutor:
             raise RuntimeError(
                 f"Application {app!r} lost focus after activation; active window is {win}"
             )
-        if win.width > 0 and win.height > 0:
-            center_x = win.x + win.width // 2
-            center_y = win.y + win.height // 2
-            selected = next(
-                (
-                    display
-                    for display in self._platform.get_displays()
-                    if display.origin_x <= center_x < display.origin_x + display.width
-                    and display.origin_y <= center_y < display.origin_y + display.height
-                ),
-                None,
-            )
-            if selected is None:
-                raise RuntimeError(f"Active window is outside all displays: {win}")
-            self._mapper.select_display(selected)
+        selected = self._display_for_window(win)
+        if selected is None:
+            raise RuntimeError(f"Active window is outside all displays: {win}")
+        self._mapper.select_display(selected)
         wx, wy, ww, wh = self._window_position_api(win)
         msg = (
             f'Activated {app}. Active window: "{win.window_title}" '
@@ -351,20 +340,76 @@ class ActionExecutor:
             return ActionResult(text=msg)
         return self.screenshot_result(msg, app=app)
 
+    def list_windows(self, *, app: str = "") -> ActionResult:
+        """List visible windows that the platform can activate by ID."""
+        app_key = app.strip().casefold()
+        active = self._platform.get_active_window()
+        windows: list[dict[str, Any]] = []
+        for window in self._platform.list_windows():
+            if app_key and app_key not in {
+                window.process_name.casefold(),
+                window.bundle_id.casefold(),
+            }:
+                continue
+            display = self._display_for_window(window)
+            windows.append({
+                "window_id": window.window_id,
+                "process_name": window.process_name,
+                "window_title": window.window_title,
+                "pid": window.pid,
+                "display": display.display_index if display is not None else None,
+                "global_x": window.x,
+                "global_y": window.y,
+                "width": window.width,
+                "height": window.height,
+                "active": bool(
+                    active is not None
+                    and active.window_id
+                    and active.window_id == window.window_id
+                ),
+            })
+        return ActionResult(text=json.dumps(windows, ensure_ascii=False))
+
+    async def activate_window(
+        self, window_id: str, *, include_screenshot: bool = True,
+    ) -> ActionResult:
+        activated = self._platform.activate_window(window_id)
+        await asyncio.sleep(0.5)
+        win = self._platform.get_active_window()
+        if win is None or win.window_id != activated.window_id:
+            raise RuntimeError(
+                f"Window {window_id!r} lost focus after activation; active window is {win}"
+            )
+        selected = self._display_for_window(win)
+        if selected is None:
+            raise RuntimeError(f"Active window is outside all displays: {win}")
+        self._mapper.select_display(selected)
+        wx, wy, ww, wh = self._window_position_api(win)
+        msg = (
+            f'Activated window {win.window_id}. Active window: "{win.window_title}" '
+            f"({win.process_name}) on display {selected.display_index} "
+            f"at ({wx}, {wy}) size {ww}x{wh}"
+        )
+        if not include_screenshot:
+            return ActionResult(text=msg)
+        return self.screenshot_result(msg, app=win.process_name)
+
     def get_active_window(self) -> ActionResult:
         win = self._platform.get_active_window()
         if win is None:
             return ActionResult(text="No active window found")
-        wx, wy, ww, wh = self._window_position_api(win)
+        display = self._display_for_window(win)
         return ActionResult(text=json.dumps(
             {
+                "window_id": win.window_id,
                 "process_name": win.process_name,
                 "window_title": win.window_title,
                 "pid": win.pid,
-                "x": wx,
-                "y": wy,
-                "width": ww,
-                "height": wh,
+                "display": display.display_index if display is not None else None,
+                "global_x": win.x,
+                "global_y": win.y,
+                "width": win.width,
+                "height": win.height,
             },
             ensure_ascii=False,
         ))
@@ -409,10 +454,23 @@ class ActionExecutor:
         if self._last_img is None:
             raise RuntimeError("screenshot context requested before screenshot capture")
         width, height = self._last_img.size
-        return (
-            f"Screenshot: display {self._mapper.display_index}, size {width}x{height}, "
+        displays = self._platform.get_displays()
+        context = (
+            f"Screenshot: display {self._mapper.display_index} of {len(displays)}, "
+            f"size {width}x{height}, "
             f"x=0..{width - 1}, y=0..{height - 1}."
         )
+        active = self._platform.get_active_window()
+        if (
+            active is not None
+            and active.window_id
+            and self._window_intersects_selected_display(active)
+        ):
+            context += (
+                f" Focused window: id={active.window_id!r}, "
+                f"app={active.process_name!r}, title={active.window_title!r}."
+            )
+        return context
 
     def _observation_context_text(self, query: str = "", *, app: str = "") -> str:
         context = self._screenshot_context_text()
@@ -422,6 +480,13 @@ class ActionExecutor:
         return context
 
     def _accessibility_context_text(self, query: str = "", *, app: str = "") -> str:
+        if not app:
+            active = self._platform.get_active_window()
+            if active is not None and not self._window_intersects_selected_display(active):
+                return (
+                    "Accessibility context unavailable: focused window is outside "
+                    f"display {self._mapper.display_index}."
+                )
         budget = A11Y_QUERY_NODE_BUDGET if query.strip() else A11Y_NODE_BUDGET
         scale = self._mapper.scale
         snapshot = self._platform.accessibility_snapshot(
@@ -549,6 +614,26 @@ class ActionExecutor:
         h_api = int(round(win.height * scale.api_h / scale.actual_h))
         return x_api, y_api, w_api, h_api
 
+    def _display_for_window(self, window):
+        best = None
+        best_area = 0
+        for display in self._platform.get_displays():
+            left = max(window.x, display.origin_x)
+            top = max(window.y, display.origin_y)
+            right = min(window.x + window.width, display.origin_x + display.width)
+            bottom = min(window.y + window.height, display.origin_y + display.height)
+            area = max(0, right - left) * max(0, bottom - top)
+            if area > best_area:
+                best = display
+                best_area = area
+        return best
+
+    def _window_intersects_selected_display(self, window) -> bool:
+        scale = self._mapper.scale
+        return Rect(window.x, window.y, window.width, window.height).intersects(
+            Rect(scale.origin_x, scale.origin_y, scale.actual_w, scale.actual_h)
+        )
+
     # ─── dispatch ────────────────────────────────────────────────────
 
     async def dispatch(
@@ -625,6 +710,12 @@ class ActionExecutor:
         if name == "activate_app":
             return await self.activate_app(
                 str(args["app"]), include_screenshot=include_screenshot,
+            )
+        if name == "list_windows":
+            return self.list_windows(app=str(args.get("app", "")))
+        if name == "activate_window":
+            return await self.activate_window(
+                str(args["window_id"]), include_screenshot=include_screenshot,
             )
         if name == "get_active_window":
             return self.get_active_window()
@@ -959,6 +1050,46 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
         },
     ),
     ToolSpec(
+        name="list_windows",
+        description=(
+            "List visible windows that can be activated by ID across all displays. "
+            "Returns each window's opaque ID, app, title, display, global bounds, "
+            "and active state. Optionally filter by an exact app/process name or "
+            "bundle ID. Use activate_window with a returned ID."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "app": {
+                    "type": "string",
+                    "description": "Optional exact app/process name or bundle ID",
+                },
+            },
+            "required": [],
+        },
+    ),
+    ToolSpec(
+        name="activate_window",
+        description=(
+            "Activate a specific visible window using an opaque ID returned by "
+            "list_windows. Switches the working display to the display containing "
+            "most of that window and returns its screenshot. The target receives "
+            "keyboard focus, but the OS may also raise sibling windows from the "
+            "same application."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "window_id": {
+                    "type": "string",
+                    "description": "Opaque window ID returned by list_windows",
+                },
+                "include_screenshot": _INCLUDE_SCREENSHOT_PROP,
+            },
+            "required": ["window_id"],
+        },
+    ),
+    ToolSpec(
         name="activate_app",
         description=(
             "Bring the given application to the foreground. Returns text "
@@ -980,9 +1111,9 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
     ToolSpec(
         name="get_active_window",
         description=(
-            "Get the currently active window as JSON (process_name, "
-            "window_title, pid, x, y, width, height). Cheap focus check "
-            "that doesn't burn a screenshot."
+            "Get the currently active window as JSON (window_id, app, title, "
+            "pid, display, and global bounds). Cheap focus check that doesn't "
+            "burn a screenshot."
         ),
         input_schema={"type": "object", "properties": {}, "required": []},
     ),

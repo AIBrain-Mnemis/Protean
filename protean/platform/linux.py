@@ -36,6 +36,9 @@ class LinuxPlatform(Platform):
     def list_windows(self) -> list[WindowInfo]:
         raise NotImplementedError("Linux backend not yet implemented")
 
+    def activate_window(self, window_id: str) -> WindowInfo:
+        raise NotImplementedError("Linux backend not yet implemented")
+
     def list_notifications(self) -> list[WindowInfo]:
         raise NotImplementedError("Linux backend not yet implemented")
 

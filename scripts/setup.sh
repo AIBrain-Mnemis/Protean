@@ -255,6 +255,21 @@ else
   skip "uv missing (see previous step)"
 fi
 
+# ---------- git hooks ----------------------------------------------------
+step "Configure Git hooks"
+if [ ! -d .git ]; then
+  skip "not a Git checkout"
+else
+  current_hooks="$(git config --local --get core.hooksPath 2>/dev/null || true)"
+  if [ -n "$current_hooks" ] && [ "$current_hooks" != ".githooks" ]; then
+    warn "core.hooksPath already set to $current_hooks; left unchanged"
+  elif git config --local core.hooksPath .githooks; then
+    pass "core.hooksPath=.githooks"
+  else
+    fail "could not configure core.hooksPath"
+  fi
+fi
+
 # ---------- protean shim -------------------------------------------------
 # Install ~/.local/bin/protean so users can run `protean ...` from anywhere
 # instead of `uv --directory ~/.protean run protean ...`.

@@ -23,7 +23,23 @@ $RepoRoot  = (Resolve-Path (Join-Path $ScriptDir '..')).Path
 Set-Location $RepoRoot
 Write-Host "Protean uninstall (root: $RepoRoot)" -ForegroundColor White
 
-# ---------- 1. unwire external agents -----------------------------------
+# ---------- 1. Git hooks ------------------------------------------------
+Write-Step "Remove Git hooks configuration"
+$currentHooks = (& git config --local --get core.hooksPath 2>$null)
+if ($currentHooks -eq '.githooks') {
+    & git config --local --unset core.hooksPath
+    if ($LASTEXITCODE -eq 0) {
+        Write-Pass "removed core.hooksPath"
+    } else {
+        Write-Fail "could not remove core.hooksPath"
+    }
+} elseif ($currentHooks) {
+    Write-Skip "core.hooksPath is custom ($currentHooks)"
+} else {
+    Write-Skip "core.hooksPath not configured"
+}
+
+# ---------- 2. unwire external agents -----------------------------------
 Write-Step "Unwire external agent runtimes (Codex / Claude Code)"
 if (-not (Test-Path '.venv\Scripts\protean.exe')) {
     Write-Skip ".venv\Scripts\protean.exe missing — nothing to unwire"
@@ -32,7 +48,7 @@ if (-not (Test-Path '.venv\Scripts\protean.exe')) {
     if ($LASTEXITCODE -eq 0) { Write-Pass "agents uninstall all" } else { Write-Fail "agents uninstall all failed" }
 }
 
-# ---------- 2. protean command shim --------------------------------------
+# ---------- 3. protean command shim --------------------------------------
 Write-Step "Remove 'protean' command shim"
 $ShimPath = Join-Path $env:USERPROFILE '.local\bin\protean.cmd'
 if (Test-Path $ShimPath) {
@@ -42,7 +58,7 @@ if (Test-Path $ShimPath) {
     Write-Skip "$ShimPath not present"
 }
 
-# ---------- 3. electron-bridge build artifacts --------------------------
+# ---------- 4. electron-bridge build artifacts --------------------------
 Write-Step "Remove electron-bridge build artifacts"
 if (-not (Test-Path electron-bridge)) {
     Write-Skip "electron-bridge/ not present"
@@ -55,7 +71,7 @@ if (-not (Test-Path electron-bridge)) {
     }
 }
 
-# ---------- 3. .venv ----------------------------------------------------
+# ---------- 5. .venv ----------------------------------------------------
 Write-Step "Remove Python virtual environment (.venv)"
 if (Test-Path .venv) {
     Remove-Item -Recurse -Force .venv
@@ -64,7 +80,7 @@ if (Test-Path .venv) {
     Write-Skip ".venv not present"
 }
 
-# ---------- 4. .env -----------------------------------------------------
+# ---------- 6. .env -----------------------------------------------------
 Write-Step "Remove .env (provider keys + model overrides)"
 if (Test-Path .env) {
     Remove-Item -Force .env
@@ -73,7 +89,7 @@ if (Test-Path .env) {
     Write-Skip ".env not present"
 }
 
-# ---------- 5. ~/.protean clone (only if we live there) -----------------
+# ---------- 7. ~/.protean clone (only if we live there) -----------------
 $defaultClone = Join-Path $HOME '.protean'
 if ($RepoRoot -eq $defaultClone) {
     Write-Step "Remove cloned repository ($RepoRoot)"

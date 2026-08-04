@@ -30,7 +30,18 @@ cd "$REPO_ROOT"
 printf "${C_BOLD}Protean uninstall${C_RESET} (root: %s)\n" "$REPO_ROOT"
 FAILED=0
 
-# ---------- 1. unwire external agents -----------------------------------
+# ---------- 1. Git hooks ------------------------------------------------
+step "Remove Git hooks configuration"
+current_hooks="$(git config --local --get core.hooksPath 2>/dev/null || true)"
+if [ "$current_hooks" = ".githooks" ]; then
+  git config --local --unset core.hooksPath && pass "removed core.hooksPath"
+elif [ -n "$current_hooks" ]; then
+  skip "core.hooksPath is custom ($current_hooks)"
+else
+  skip "core.hooksPath not configured"
+fi
+
+# ---------- 2. unwire external agents -----------------------------------
 step "Unwire external agent runtimes (Codex / Claude Code)"
 if [ ! -x .venv/bin/protean ]; then
   skip ".venv/bin/protean missing — nothing to unwire"
@@ -40,7 +51,7 @@ else
   fail "agents uninstall all failed"
 fi
 
-# ---------- 2. protean command shim --------------------------------------
+# ---------- 3. protean command shim --------------------------------------
 step "Remove 'protean' command shim"
 SHIM_PATH="$HOME/.local/bin/protean"
 if [ -f "$SHIM_PATH" ]; then
@@ -49,7 +60,7 @@ else
   skip "$SHIM_PATH not present"
 fi
 
-# ---------- 3. electron-bridge build artifacts --------------------------
+# ---------- 4. electron-bridge build artifacts --------------------------
 step "Remove electron-bridge build artifacts"
 if [ ! -d electron-bridge ]; then
   skip "electron-bridge/ not present"
@@ -61,7 +72,7 @@ else
   done
 fi
 
-# ---------- 3. .venv ----------------------------------------------------
+# ---------- 5. .venv ----------------------------------------------------
 step "Remove Python virtual environment (.venv)"
 if [ -d .venv ]; then
   rm -rf .venv && pass "removed .venv"
@@ -69,7 +80,7 @@ else
   skip ".venv not present"
 fi
 
-# ---------- 4. .env -----------------------------------------------------
+# ---------- 6. .env -----------------------------------------------------
 step "Remove .env (provider keys + model overrides)"
 if [ -f .env ]; then
   rm -f .env && pass "removed .env"
@@ -77,7 +88,7 @@ else
   skip ".env not present"
 fi
 
-# ---------- 5. ~/.protean clone (only if we live there) -----------------
+# ---------- 7. ~/.protean clone (only if we live there) -----------------
 if [ "$REPO_ROOT" = "$HOME/.protean" ]; then
   step "Remove cloned repository ($REPO_ROOT)"
   # Schedule self-deletion via a detached shell so we can rm our own cwd.

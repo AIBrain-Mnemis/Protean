@@ -216,6 +216,24 @@ if (Test-Cmd 'uv') {
     Write-Skip "uv missing (see previous step)"
 }
 
+# ---------- git hooks ----------------------------------------------------
+Write-Step "Configure Git hooks"
+if (-not (Test-Path .git)) {
+    Write-Skip "not a Git checkout"
+} else {
+    $currentHooks = (& git config --local --get core.hooksPath 2>$null)
+    if ($currentHooks -and $currentHooks -ne '.githooks') {
+        Write-Warn "core.hooksPath already set to $currentHooks; left unchanged"
+    } else {
+        & git config --local core.hooksPath .githooks
+        if ($LASTEXITCODE -eq 0) {
+            Write-Pass "core.hooksPath=.githooks"
+        } else {
+            Write-Fail "could not configure core.hooksPath"
+        }
+    }
+}
+
 # ---------- protean shim -------------------------------------------------
 # Install %USERPROFILE%\.local\bin\protean.cmd so users can run `protean ...`
 # from anywhere instead of `uv --directory <repo> run protean ...`.

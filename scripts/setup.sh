@@ -284,6 +284,45 @@ else
   fail ".env.example missing — cannot create .env"
 fi
 
+# ---------- storage paths ------------------------------------------------
+step "Configure Protean storage"
+current_data="$(env_get PROTEAN_DATA_DIR)"
+current_skills="$(env_get PROTEAN_SKILLS_DIR)"
+current_recordings="$(env_get PROTEAN_RECORDINGS_DIR)"
+configured_count=0
+[ -n "$current_data" ] && configured_count=$((configured_count + 1))
+[ -n "$current_skills" ] && configured_count=$((configured_count + 1))
+[ -n "$current_recordings" ] && configured_count=$((configured_count + 1))
+if [ "$configured_count" -ne 0 ] && [ "$configured_count" -ne 3 ]; then
+  warn "partial custom storage configuration detected; existing paths were preserved"
+elif ! command -v uv >/dev/null 2>&1; then
+  skip "uv missing — cannot configure storage"
+else
+  default_data="$REPO_ROOT/data"
+  suggested_data="${current_data:-$default_data}"
+  selected_data="$(ask_input "Protean data directory" "$suggested_data")"
+  if [ -n "$current_data" ] && [ "$selected_data" = "$current_data" ]; then
+    pass "storage paths unchanged"
+    info "Data: $current_data"
+  else
+    case "$selected_data" in
+      /*) data_root="$selected_data" ;;
+      *)  data_root="$REPO_ROOT/$selected_data" ;;
+    esac
+    uv run python scripts/configure_storage.py \
+        --repo-root "$REPO_ROOT" \
+        --env-file "$REPO_ROOT/.env" \
+        --data-dir "$data_root" \
+        --prompt-migration
+    storage_status=$?
+    case "$storage_status" in
+      0) pass "storage configured at $data_root" ;;
+      2) skip "storage paths unchanged" ;;
+      *) fail "storage migration failed" ;;
+    esac
+  fi
+fi
+
 # ---------- ffmpeg -------------------------------------------------------
 step "Check ffmpeg (provides ffmpeg + ffprobe)"
 if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then

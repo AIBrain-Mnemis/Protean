@@ -104,6 +104,7 @@ from protean.platform.base import (
     Rect,
     ScrollDirection,
     WindowInfo,
+    app_identifier_matches,
 )
 
 log = logging.getLogger(__name__)
@@ -429,8 +430,9 @@ class MacOSPlatform(Platform):
 
     def _window_info(self, win: dict, *, bundle_id: str) -> WindowInfo:
         x, y, width, height = self._cg_window_rect(win)
+        pid = int(win.get("kCGWindowOwnerPID", 0))
         return WindowInfo(
-            pid=int(win.get("kCGWindowOwnerPID", 0)),
+            pid=pid,
             process_name=str(win.get("kCGWindowOwnerName", "")),
             window_title=str(win.get("kCGWindowName", "")),
             window_id=str(win.get("kCGWindowNumber", "")),
@@ -439,6 +441,9 @@ class MacOSPlatform(Platform):
             y=y,
             width=width,
             height=height,
+            app_identifiers=self._running_app_identifiers(
+                NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+            ),
         )
 
     def _activate_pid(self, pid: int) -> None:
@@ -1913,21 +1918,25 @@ class MacOSPlatform(Platform):
         )
 
     def _find_running_app(self, app: str):
-        app_key = app.casefold()
         for item in NSWorkspace.sharedWorkspace().runningApplications():
-            identifiers = {
-                (item.localizedName() or "").casefold(),
-                (item.bundleIdentifier() or "").casefold(),
-            }
-            executable_url = item.executableURL()
-            bundle_url = item.bundleURL()
-            if executable_url is not None:
-                identifiers.add(Path(executable_url.path()).stem.casefold())
-            if bundle_url is not None:
-                identifiers.add(Path(bundle_url.path()).stem.casefold())
-            if app_key in identifiers:
+            if app_identifier_matches(app, self._running_app_identifiers(item)):
                 return item
         return None
+
+    @staticmethod
+    def _running_app_identifiers(item) -> tuple[str, ...]:
+        if item is None:
+            return ()
+        identifiers = [item.localizedName() or "", item.bundleIdentifier() or ""]
+        executable_url = item.executableURL()
+        bundle_url = item.bundleURL()
+        if executable_url is not None:
+            executable = Path(executable_url.path())
+            identifiers.extend((executable.stem, executable.name))
+        if bundle_url is not None:
+            bundle = Path(bundle_url.path())
+            identifiers.extend((bundle.stem, bundle.name))
+        return tuple(dict.fromkeys(identifier for identifier in identifiers if identifier))
 
     def _resolve_application(self, app: str) -> tuple[str, str]:
         workspace = NSWorkspace.sharedWorkspace()

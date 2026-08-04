@@ -20,6 +20,12 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
+import win32api
+import win32clipboard
+import win32con
+import win32gui
+import win32process
+
 from protean.platform.base import (
     AccessibilityNode,
     AccessibilitySnapshot,
@@ -31,6 +37,7 @@ from protean.platform.base import (
     Rect,
     ScrollDirection,
     WindowInfo,
+    window_matches_app,
 )
 
 log = logging.getLogger(__name__)
@@ -319,6 +326,40 @@ def _get_process_name(pid: int) -> str:
         ctypes.windll.kernel32.CloseHandle(h)
 
 
+def _get_process_identifiers(pid: int) -> tuple[str, ...]:
+    """Return stable executable identifiers for a Windows process."""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return ()
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        size = ctypes.wintypes.DWORD(len(buf))
+        if not ctypes.windll.kernel32.QueryFullProcessImageNameW(
+            h, 0, buf, ctypes.byref(size),
+        ):
+            return ()
+        executable = Path(buf.value)
+    finally:
+        ctypes.windll.kernel32.CloseHandle(h)
+
+    identifiers = [executable.stem, executable.name]
+    try:
+        translations = win32api.GetFileVersionInfo(
+            str(executable), "\\VarFileInfo\\Translation",
+        )
+        for language, codepage in translations:
+            description = win32api.GetFileVersionInfo(
+                str(executable),
+                f"\\StringFileInfo\\{language:04x}{codepage:04x}\\FileDescription",
+            )
+            if description:
+                identifiers.append(str(description))
+    except Exception:
+        pass
+    return tuple(dict.fromkeys(identifiers))
+
+
 def _escape_ps(text: str) -> str:
     """Escape text for PowerShell XML strings."""
     return (
@@ -383,12 +424,6 @@ class WindowsPlatform(Platform):
     # ── Window info ──────────────────────────────────────
 
     def get_active_window(self) -> WindowInfo | None:
-        try:
-            import win32gui
-            import win32process
-        except ImportError:
-            return self._get_active_window_fallback()
-
         hwnd = win32gui.GetForegroundWindow()
         if not hwnd:
             return None
@@ -437,47 +472,11 @@ class WindowsPlatform(Platform):
             width=right - left, height=bottom - top,
         )
 
-    def _get_active_window_fallback(self) -> WindowInfo | None:
-        """Fallback using ctypes when pywin32 is not installed."""
-        user32 = ctypes.windll.user32
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd:
-            return None
-        length = user32.GetWindowTextLengthW(hwnd) + 1
-        buf = ctypes.create_unicode_buffer(length)
-        user32.GetWindowTextW(hwnd, buf, length)
-        title = buf.value
-        pid = ctypes.wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-
-        if not title:
-            GA_ROOTOWNER = 3
-            root = user32.GetAncestor(hwnd, GA_ROOTOWNER)
-            if root and root != hwnd:
-                rl = user32.GetWindowTextLengthW(root) + 1
-                rb = ctypes.create_unicode_buffer(rl)
-                user32.GetWindowTextW(root, rb, rl)
-                title = rb.value
-
-        return WindowInfo(
-            pid=pid.value,
-            process_name=_get_process_name(pid.value),
-            window_title=title,
-            window_id=str(hwnd),
-        )
-
     def get_window_at_point(self, x: int, y: int) -> WindowInfo | None:
         """Hit-test the screen at (x, y) and return its top-level window.
 
         Walks up to the root window so child controls map to their host frame.
-        Falls back to ``get_active_window`` when pywin32 isn't available.
         """
-        try:
-            import win32gui
-            import win32process
-        except ImportError:
-            return self.get_active_window()
-
         try:
             hwnd = win32gui.WindowFromPoint((int(x), int(y)))
         except Exception:
@@ -522,16 +521,13 @@ class WindowsPlatform(Platform):
         )
 
     def list_windows(self) -> list[WindowInfo]:
-        try:
-            import win32gui
-            import win32process
-        except ImportError:
-            return []
+        return self._list_activatable_windows()
 
+    def _list_activatable_windows(self) -> list[WindowInfo]:
         results: list[WindowInfo] = []
 
         def _enum_cb(hwnd: int, _: object) -> bool:
-            if not win32gui.IsWindowVisible(hwnd):
+            if not self._is_activatable_hwnd(hwnd):
                 return True
             title = win32gui.GetWindowText(hwnd)
             if not title:
@@ -548,23 +544,71 @@ class WindowsPlatform(Platform):
                 window_id=str(hwnd),
                 x=left, y=top,
                 width=right - left, height=bottom - top,
+                app_identifiers=_get_process_identifiers(pid),
             ))
             return True
 
         win32gui.EnumWindows(_enum_cb, None)
         return results
 
+    @staticmethod
+    def _is_activatable_hwnd(hwnd: int) -> bool:
+        if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+            return False
+        get_shell_window = ctypes.windll.user32.GetShellWindow
+        get_shell_window.argtypes = ()
+        get_shell_window.restype = ctypes.wintypes.HWND
+        if hwnd == get_shell_window():
+            return False
+
+        extended_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        if extended_style & win32con.WS_EX_NOACTIVATE:
+            return False
+        if (
+            extended_style & win32con.WS_EX_TOOLWINDOW
+            and not extended_style & win32con.WS_EX_APPWINDOW
+        ):
+            return False
+        if WindowsPlatform._is_cloaked_hwnd(hwnd):
+            return False
+        if extended_style & win32con.WS_EX_LAYERED:
+            try:
+                _, alpha, flags = win32gui.GetLayeredWindowAttributes(hwnd)
+            except win32gui.error:
+                pass
+            else:
+                if flags & win32con.LWA_ALPHA and alpha == 0:
+                    return False
+
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        return right - left >= 2 and bottom - top >= 2
+
+    @staticmethod
+    def _is_cloaked_hwnd(hwnd: int) -> bool:
+        cloaked = ctypes.wintypes.DWORD()
+        get_attribute = ctypes.windll.dwmapi.DwmGetWindowAttribute
+        get_attribute.argtypes = (
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.wintypes.DWORD,
+        )
+        get_attribute.restype = ctypes.c_long
+        result = get_attribute(
+            ctypes.wintypes.HWND(hwnd),
+            14,
+            ctypes.byref(cloaked),
+            ctypes.sizeof(cloaked),
+        )
+        return result == 0 and bool(cloaked.value)
+
     def activate_window(self, window_id: str) -> WindowInfo:
         try:
             target_hwnd = int(window_id)
         except ValueError as error:
             raise ValueError(f"Invalid Windows window ID: {window_id!r}") from error
-        try:
-            import win32gui
-        except ImportError as error:
-            raise RuntimeError("pywin32 is required to activate a window by ID") from error
-        if not win32gui.IsWindow(target_hwnd) or not win32gui.IsWindowVisible(target_hwnd):
-            raise RuntimeError(f"Window {window_id!r} is not visible")
+        if not self._is_activatable_hwnd(target_hwnd):
+            raise RuntimeError(f"Window {window_id!r} is not activatable")
         return self._activate_window_handle(
             target_hwnd, f"window {window_id!r}", exact=True,
         )
@@ -575,11 +619,6 @@ class WindowsPlatform(Platform):
     # ── Display info ─────────────────────────────────────
 
     def get_displays(self) -> list[DisplayInfo]:
-        try:
-            import win32api
-        except ImportError:
-            return self._get_displays_fallback()
-
         monitors = win32api.EnumDisplayMonitors(None, None)
         results: list[DisplayInfo] = []
         self._monitor_rects.clear()
@@ -617,12 +656,6 @@ class WindowsPlatform(Platform):
 
         return results
 
-    def _get_displays_fallback(self) -> list[DisplayInfo]:
-        w = ctypes.windll.user32.GetSystemMetrics(0)  # SM_CXSCREEN
-        h = ctypes.windll.user32.GetSystemMetrics(1)  # SM_CYSCREEN
-        self._monitor_rects[1] = (0, 0, w, h)
-        return [DisplayInfo(display_id=0, display_index=1, width=w, height=h, is_primary=True)]
-
     def get_cursor_position(self) -> tuple[int, int]:
         # Prefer GetPhysicalCursorPos (always returns physical pixel coords)
         pt = ctypes.wintypes.POINT()
@@ -631,12 +664,7 @@ class WindowsPlatform(Platform):
                 return (pt.x, pt.y)
         except Exception:
             pass
-        try:
-            import win32api
-            return win32api.GetCursorPos()
-        except ImportError:
-            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-            return (pt.x, pt.y)
+        return win32api.GetCursorPos()
 
     # ── Screen capture ───────────────────────────────────
 
@@ -907,20 +935,14 @@ class WindowsPlatform(Platform):
         """
         # Save current clipboard text (best-effort; images/files are lost).
         old_text: str | None = None
+        win32clipboard.OpenClipboard()
         try:
-            import win32clipboard
-            import win32con
-            win32clipboard.OpenClipboard()
-            try:
-                old_text = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
-            except Exception:
-                pass
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
-            win32clipboard.CloseClipboard()
-        except ImportError:
-            old_text = self._get_clipboard_text_ctypes()
-            self._set_clipboard_ctypes(text)
+            old_text = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+        except Exception:
+            pass
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
+        win32clipboard.CloseClipboard()
 
         time.sleep(0.05)
         self.key_press("ctrl", "v")
@@ -928,62 +950,13 @@ class WindowsPlatform(Platform):
 
         # Restore previous clipboard.
         if old_text is not None:
-            try:
-                import win32clipboard
-                import win32con
-                win32clipboard.OpenClipboard()
-                win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, old_text)
-                win32clipboard.CloseClipboard()
-            except ImportError:
-                self._set_clipboard_ctypes(old_text)
-
-    def _get_clipboard_text_ctypes(self) -> str | None:
-        """Read clipboard text using ctypes (no pywin32 needed)."""
-        CF_UNICODETEXT = 13
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        if not user32.OpenClipboard(0):
-            return None
-        try:
-            h = user32.GetClipboardData(CF_UNICODETEXT)
-            if not h:
-                return None
-            ptr = kernel32.GlobalLock(h)
-            if not ptr:
-                return None
-            try:
-                return ctypes.wstring_at(ptr)
-            finally:
-                kernel32.GlobalUnlock(h)
-        finally:
-            user32.CloseClipboard()
-
-    def _set_clipboard_ctypes(self, text: str) -> None:
-        """Set clipboard using ctypes (no pywin32 needed)."""
-        CF_UNICODETEXT = 13
-        GMEM_MOVEABLE = 0x0002
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-
-        user32.OpenClipboard(0)
-        user32.EmptyClipboard()
-        data = text.encode("utf-16-le") + b"\x00\x00"
-        h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
-        ptr = kernel32.GlobalLock(h)
-        ctypes.memmove(ptr, data, len(data))
-        kernel32.GlobalUnlock(h)
-        user32.SetClipboardData(CF_UNICODETEXT, h)
-        user32.CloseClipboard()
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, old_text)
+            win32clipboard.CloseClipboard()
 
     def get_clipboard(self) -> ClipboardContent:
         """Read structured clipboard content (text, files, or image metadata)."""
-        try:
-            import win32clipboard
-            import win32con
-        except ImportError:
-            return self._get_clipboard_ctypes()
-
         try:
             win32clipboard.OpenClipboard()
         except Exception:
@@ -1023,69 +996,6 @@ class WindowsPlatform(Platform):
             return ClipboardContent()
         finally:
             win32clipboard.CloseClipboard()
-
-    def _get_clipboard_ctypes(self) -> ClipboardContent:
-        """Read clipboard using ctypes (no pywin32 needed)."""
-        CF_UNICODETEXT = 13
-        CF_HDROP = 15
-        CF_DIB = 8
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        if not user32.OpenClipboard(0):
-            return ClipboardContent()
-        try:
-            # Files
-            if user32.IsClipboardFormatAvailable(CF_HDROP):
-                h = user32.GetClipboardData(CF_HDROP)
-                if h:
-                    try:
-                        shell32 = ctypes.windll.shell32
-                        count = shell32.DragQueryFileW(h, 0xFFFFFFFF, None, 0)
-                        files: list[str] = []
-                        buf = ctypes.create_unicode_buffer(260)
-                        for i in range(count):
-                            shell32.DragQueryFileW(h, i, buf, 260)
-                            files.append(buf.value)
-                        if files:
-                            return ClipboardContent(kind="files", files=files)
-                    except Exception:
-                        pass
-
-            # Text (before image — same priority as pywin32 path)
-            if user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
-                h = user32.GetClipboardData(CF_UNICODETEXT)
-                if h:
-                    ptr = kernel32.GlobalLock(h)
-                    if ptr:
-                        try:
-                            text = ctypes.wstring_at(ptr)
-                            if text:
-                                return ClipboardContent(kind="text", text=text)
-                        finally:
-                            kernel32.GlobalUnlock(h)
-
-            # Image
-            if user32.IsClipboardFormatAvailable(CF_DIB):
-                h = user32.GetClipboardData(CF_DIB)
-                if h:
-                    ptr = kernel32.GlobalLock(h)
-                    if ptr:
-                        try:
-                            import struct
-                            header = ctypes.string_at(ptr, 16)
-                            if len(header) >= 16:
-                                _, w, hh = struct.unpack_from("<Iii", header, 0)
-                                return ClipboardContent(
-                                    kind="image",
-                                    image_width=abs(w),
-                                    image_height=abs(hh),
-                                )
-                        finally:
-                            kernel32.GlobalUnlock(h)
-
-            return ClipboardContent()
-        finally:
-            user32.CloseClipboard()
 
     def key_press(self, *keys: str) -> None:
         """Press a keyboard shortcut via SendInput.
@@ -2050,54 +1960,25 @@ class WindowsPlatform(Platform):
 
     def activate_app(self, app: str) -> WindowInfo:
         """Bring an app to foreground using AttachThreadInput trick."""
-        try:
-            import win32gui
-            import win32process
-        except ImportError:
-            try:
-                win = self._find_app_window(app)
-                if win is None:
-                    raise RuntimeError(f"Application window not found: {app!r}")
-                win.SetFocus()
-                target_hwnd = int(win.NativeWindowHandle)
-            except Exception as e:
-                raise RuntimeError(f"Application {app!r} could not be activated: {e}") from e
-            return self._wait_for_foreground_window(app, target_hwnd)
-
-        target_hwnd = None
-        app_lower = app.lower()
-
-        def _find_cb(hwnd: int, _: object) -> bool:
-            nonlocal target_hwnd
-            if not win32gui.IsWindowVisible(hwnd):
-                return True
-            title = win32gui.GetWindowText(hwnd).lower()
-            if app_lower in title:
-                target_hwnd = hwnd
-                return False
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            if app_lower in _get_process_name(pid).lower():
-                target_hwnd = hwnd
-                return False
-            return True
-
-        try:
-            win32gui.EnumWindows(_find_cb, None)
-        except Exception:
-            pass
+        target_hwnd = next(
+            (
+                int(window.window_id)
+                for window in self._list_activatable_windows()
+                if window_matches_app(window, app)
+            ),
+            None,
+        )
 
         if target_hwnd is None:
             raise RuntimeError(f"Application window not found: {app!r}")
 
-        return self._activate_window_handle(target_hwnd, f"application {app!r}")
+        return self._activate_window_handle(
+            target_hwnd, f"application {app!r}", exact=True,
+        )
 
     def _activate_window_handle(
         self, target_hwnd: int, target: str, *, exact: bool = False,
     ) -> WindowInfo:
-        import win32con
-        import win32gui
-        import win32process
-
         try:
             if win32gui.IsIconic(target_hwnd):
                 win32gui.ShowWindow(target_hwnd, win32con.SW_RESTORE)

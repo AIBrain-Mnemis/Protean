@@ -41,6 +41,7 @@ from protean.platform.base import (
     ScrollDirection,
     parse_key_combo,
     prepare_screenshot_for_llm,
+    window_matches_app,
 )
 
 if TYPE_CHECKING:
@@ -346,10 +347,7 @@ class ActionExecutor:
         active = self._platform.get_active_window()
         windows: list[dict[str, Any]] = []
         for window in self._platform.list_windows():
-            if app_key and app_key not in {
-                window.process_name.casefold(),
-                window.bundle_id.casefold(),
-            }:
+            if app_key and not window_matches_app(window, app_key):
                 continue
             display = self._display_for_window(window)
             windows.append({
@@ -1054,15 +1052,16 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
         description=(
             "List visible windows that can be activated by ID across all displays. "
             "Returns each window's opaque ID, app, title, display, global bounds, "
-            "and active state. Optionally filter by an exact app/process name or "
-            "bundle ID. Use activate_window with a returned ID."
+            "and active state. Optionally filter by an exact stable application "
+            "identifier (app, process, executable, or bundle ID). Use "
+            "activate_window with a returned ID."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "app": {
                     "type": "string",
-                    "description": "Optional exact app/process name or bundle ID",
+                    "description": "Optional exact stable application identifier",
                 },
             },
             "required": [],
@@ -1101,7 +1100,7 @@ GUI_TOOL_SPECS: list[ToolSpec] = [
             "properties": {
                 "app": {
                     "type": "string",
-                    "description": "Application name, process name, or bundle ID",
+                    "description": "Exact stable application identifier",
                 },
                 "include_screenshot": _INCLUDE_SCREENSHOT_PROP,
             },

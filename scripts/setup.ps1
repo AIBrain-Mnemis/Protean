@@ -238,6 +238,47 @@ if (Test-Path .env) {
     Write-Fail ".env.example missing — cannot create .env"
 }
 
+# ---------- storage paths ------------------------------------------------
+Write-Step "Configure Protean storage"
+$currentData = Env-Get 'PROTEAN_DATA_DIR'
+$currentSkills = Env-Get 'PROTEAN_SKILLS_DIR'
+$currentRecordings = Env-Get 'PROTEAN_RECORDINGS_DIR'
+$configuredCount = @($currentData, $currentSkills, $currentRecordings).Where({ $_ }).Count
+if ($configuredCount -ne 0 -and $configuredCount -ne 3) {
+    Write-Warn "partial custom storage configuration detected; existing paths were preserved"
+} elseif (-not (Test-Cmd 'uv')) {
+    Write-Skip "uv missing — cannot configure storage"
+} else {
+    $defaultData = Join-Path $RepoRoot 'data'
+    $suggestedData = if ($currentData) { $currentData } else { $defaultData }
+    $selectedData = Ask-Input "Protean data directory" $suggestedData
+    $configureStorage = $true
+    if ($currentData -and $selectedData -eq $currentData) {
+        Write-Pass "storage paths unchanged"
+        Write-Info "Data: $currentData"
+        $configureStorage = $false
+    }
+    if ($configureStorage) {
+        if ([System.IO.Path]::IsPathRooted($selectedData)) {
+            $dataRoot = [System.IO.Path]::GetFullPath($selectedData)
+        } else {
+            $dataRoot = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $selectedData))
+        }
+        & uv run python scripts/configure_storage.py `
+            --repo-root $RepoRoot `
+            --env-file (Join-Path $RepoRoot '.env') `
+            --data-dir $dataRoot `
+            --prompt-migration
+        if ($LASTEXITCODE -eq 0) {
+            Write-Pass "storage configured at $dataRoot"
+        } elseif ($LASTEXITCODE -eq 2) {
+            Write-Skip "storage paths unchanged"
+        } else {
+            Write-Fail "storage migration failed"
+        }
+    }
+}
+
 # ---------- ffmpeg -------------------------------------------------------
 Write-Step "Check ffmpeg (provides ffmpeg + ffprobe)"
 Refresh-SessionPath

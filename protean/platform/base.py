@@ -35,6 +35,23 @@ class WindowInfo:
     y: int = 0
     width: int = 0
     height: int = 0
+    app_identifiers: tuple[str, ...] = ()
+
+
+def app_identifier_matches(app: str, identifiers: tuple[str, ...]) -> bool:
+    """Return whether ``app`` exactly matches a stable application identifier."""
+    app_key = app.strip().casefold()
+    return bool(app_key) and app_key in {
+        identifier.casefold() for identifier in identifiers if identifier
+    }
+
+
+def window_matches_app(window: WindowInfo, app: str) -> bool:
+    """Match a window by stable app identity; window titles are never identifiers."""
+    return app_identifier_matches(
+        app,
+        (window.process_name, window.bundle_id, *window.app_identifiers),
+    )
 
 
 @dataclass
@@ -160,7 +177,11 @@ class Platform(Protocol):
         ...
 
     def list_windows(self) -> list[WindowInfo]:
-        """List visible application windows that can be activated by ID."""
+        """List normal application windows that can be activated by ID.
+
+        Desktop elements, special-purpose windows, fully transparent windows,
+        and windows without usable bounds are excluded.
+        """
         ...
 
     def activate_window(self, window_id: str) -> WindowInfo:
@@ -422,7 +443,7 @@ class Platform(Protocol):
         )
 
     def activate_app(self, app: str) -> WindowInfo:
-        """Bring an application to the foreground and return its active window."""
+        """Bring an application window eligible for ``list_windows`` forward."""
         ...
 
     # ── Notifications ────────────────────────────────────

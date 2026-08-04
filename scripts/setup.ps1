@@ -12,6 +12,7 @@ param()
 
 $ErrorActionPreference = 'Continue'  # collect a final status, don't bail
 $script:Failed = $false
+$script:Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 # ---------- pretty output ------------------------------------------------
 function Write-Step  { param($Msg) Write-Host "`n> $Msg" -ForegroundColor Blue }
@@ -57,7 +58,7 @@ function Ask-Input {
 function Env-Get {
     param([string]$Key)
     if (-not (Test-Path .env)) { return '' }
-    foreach ($line in Get-Content .env) {
+    foreach ($line in [System.IO.File]::ReadAllLines((Resolve-Path .env), $script:Utf8NoBom)) {
         if ($line -match "^\s*$([regex]::Escape($Key))=(.*)$") {
             return $matches[1].Trim().Trim("'").Trim('"')
         }
@@ -67,7 +68,11 @@ function Env-Get {
 
 function Env-Set {
     param([string]$Key, [string]$Value)
-    $lines = if (Test-Path .env) { Get-Content .env } else { @() }
+    $lines = if (Test-Path .env) {
+        [System.IO.File]::ReadAllLines((Resolve-Path .env), $script:Utf8NoBom)
+    } else {
+        @()
+    }
     $found = $false
     $out = foreach ($line in $lines) {
         if ($line -match "^\s*$([regex]::Escape($Key))=") {
@@ -78,7 +83,8 @@ function Env-Set {
         }
     }
     if (-not $found) { $out += "$Key=$Value" }
-    Set-Content -Path .env -Value $out -Encoding UTF8
+    $envPath = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) '.env'))
+    [System.IO.File]::WriteAllLines($envPath, [string[]]$out, $script:Utf8NoBom)
 }
 
 function Test-Cmd { param($Name) [bool](Get-Command $Name -ErrorAction SilentlyContinue) }

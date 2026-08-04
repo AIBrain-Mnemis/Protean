@@ -82,15 +82,6 @@ def strict_json_schema(model: type[BaseModel]) -> dict:
     schema = model.model_json_schema()
     defs = schema.pop("$defs", {})
 
-    if "properties" in schema:
-        to_remove = [
-            name
-            for name, prop in schema["properties"].items()
-            if isinstance(prop, dict) and prop.get("exclude_from_llm")
-        ]
-        for name in to_remove:
-            del schema["properties"][name]
-
     def _resolve(obj: Any) -> Any:
         if isinstance(obj, dict):
             if "$ref" in obj:
@@ -104,6 +95,13 @@ def strict_json_schema(model: type[BaseModel]) -> dict:
             for key, value in obj.items():
                 result[key] = _resolve(value)
             if result.get("type") == "object" and "properties" in result:
+                to_remove = [
+                    name
+                    for name, prop in result["properties"].items()
+                    if isinstance(prop, dict) and prop.get("exclude_from_llm")
+                ]
+                for name in to_remove:
+                    del result["properties"][name]
                 result["additionalProperties"] = False
                 result["required"] = list(result["properties"].keys())
             return result

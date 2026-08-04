@@ -2,7 +2,7 @@
 #
 # Idempotent: every step checks before it acts, so re-running is safe.
 # Each step prints PASS / SKIP / FAIL; exit code is 1 if any required step
-# fails. Interactive only — no flags.
+# fails. Interactive only - no flags.
 #
 # Env:
 #   PROTEAN_REPO_URL   git URL used when the script is run outside a checkout
@@ -158,7 +158,7 @@ if ($CandidateRoot -and (Test-ProteanRepo $CandidateRoot.Path)) {
     Write-Host "Protean setup (no local repo detected)" -ForegroundColor White
     Write-Step "Clone Protean repository"
     if (-not (Test-Cmd 'git')) {
-        Write-Fail "git not found — install git and re-run"
+        Write-Fail "git not found - install git and re-run"
         exit 1
     }
     $defaultDir = Join-Path $HOME '.protean'
@@ -168,7 +168,7 @@ if ($CandidateRoot -and (Test-ProteanRepo $CandidateRoot.Path)) {
     if (Test-Path (Join-Path $target '.git')) {
         Write-Pass "$target already cloned, reusing"
     } elseif ((Test-Path $target) -and (Get-ChildItem -Force -Path $target -ErrorAction SilentlyContinue)) {
-        Write-Fail "$target exists and is not empty — pick another path"
+        Write-Fail "$target exists and is not empty - pick another path"
         exit 1
     } else {
         git clone $url $target
@@ -200,7 +200,7 @@ if (Test-Cmd 'uv') {
             Write-Pass "uv $uvVer (installed)"
             Write-Warn "Restart your shell so future sessions pick up uv on PATH"
         } else {
-            Write-Fail "uv installed but not on PATH — restart your shell and re-run setup"
+            Write-Fail "uv installed but not on PATH - restart your shell and re-run setup"
         }
     } else {
         Write-Fail "uv required; install manually: irm https://astral.sh/uv/install.ps1 | iex"
@@ -248,7 +248,7 @@ uv --directory "$RepoRoot" run protean %*
 Write-Pass "installed $ShimPath -> protean (at $RepoRoot)"
 $pathDirs = $env:PATH -split ';'
 if ($pathDirs -notcontains $ShimDir) {
-    Write-Warn "$ShimDir is not on your PATH — add it via 'setx PATH `"%PATH%;$ShimDir`"'"
+    Write-Warn "$ShimDir is not on your PATH - add it via 'setx PATH `"%PATH%;$ShimDir`"'"
 }
 
 # ---------- .env ---------------------------------------------------------
@@ -259,7 +259,7 @@ if (Test-Path .env) {
     Copy-Item .env.example .env
     Write-Pass "created .env from .env.example"
 } else {
-    Write-Fail ".env.example missing — cannot create .env"
+    Write-Fail ".env.example missing - cannot create .env"
 }
 
 # ---------- storage paths ------------------------------------------------
@@ -271,7 +271,7 @@ $configuredCount = @($currentData, $currentSkills, $currentRecordings).Where({ $
 if ($configuredCount -ne 0 -and $configuredCount -ne 3) {
     Write-Warn "partial custom storage configuration detected; existing paths were preserved"
 } elseif (-not (Test-Cmd 'uv')) {
-    Write-Skip "uv missing — cannot configure storage"
+    Write-Skip "uv missing - cannot configure storage"
 } else {
     $defaultData = Join-Path $RepoRoot 'data'
     $suggestedData = if ($currentData) { $currentData } else { $defaultData }
@@ -331,12 +331,12 @@ if (Test-Cmd 'node') {
         Write-Pass "node v$nodeVer (>= 22, realtime path supported)"
         $NodeOK = $true
     } elseif ($nodeMajor -ge 18) {
-        Write-Warn "node v$nodeVer (>= 18, CUA terminal tool only — realtime needs >= 22)"
+        Write-Warn "node v$nodeVer (>= 18, CUA terminal tool only - realtime needs >= 22)"
     } else {
         Write-Fail "node v$nodeVer too old (need >= 22 for realtime, >= 18 for CUA terminal)"
     }
 } else {
-    Write-Warn "node not found — needed only for realtime voice path"
+    Write-Warn "node not found - needed only for realtime voice path"
     Write-Info "Install Node 22+ via 'winget install OpenJS.NodeJS.LTS' or https://nodejs.org"
     Write-Info "Or set PROTEAN_CUA_TERMINAL=false to skip Node entirely"
 }
@@ -354,13 +354,13 @@ if (-not (Test-Path electron-bridge)) {
         try {
             if (-not (Test-Path node_modules)) {
                 Write-Info "npm install ..."
-                & npm install --silent
+                & npm.cmd install --silent
                 if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
             } else {
                 Write-Info "node_modules present, skipping npm install"
             }
             Write-Info "npm run build ..."
-            & npm run build --silent
+            & npm.cmd run build --silent
             if ($LASTEXITCODE -ne 0) { throw "npm run build failed" }
             Write-Pass "electron-bridge built"
         } catch {
@@ -383,9 +383,9 @@ function Wire-Agent {
 }
 
 if (-not (Test-Cmd 'uv')) {
-    Write-Skip "uv missing — cannot run 'protean agents setup'"
+    Write-Skip "uv missing - cannot run 'protean agents setup'"
 } elseif (-not (Test-Path '.venv\Scripts\protean.exe')) {
-    Write-Skip ".venv\Scripts\protean.exe missing — uv sync failed?"
+    Write-Skip ".venv\Scripts\protean.exe missing - uv sync failed?"
 } else {
     Write-Info "Skips an agent automatically when its home directory is absent."
     $userProfile = $env:USERPROFILE
@@ -451,7 +451,7 @@ if ($doConfigure) {
             $secret = Ask-Secret "$provider API key"
         }
         if ([string]::IsNullOrEmpty($secret) -and -not $currentKey) {
-            Write-Fail "$($meta.Key) (empty input) — default provider not written"
+            Write-Fail "$($meta.Key) (empty input) - default provider not written"
         } else {
             Env-Set 'PROTEAN_DEFAULT_PROVIDER' $provider
             if ($secret) {
@@ -493,7 +493,7 @@ if ($doConfigure) {
     } else {
         $geminiKey = Ask-Secret "Gemini API key"
         if ([string]::IsNullOrEmpty($geminiKey)) {
-            Write-Fail "GEMINI_API_KEY (empty input) — realtime not enabled"
+            Write-Fail "GEMINI_API_KEY (empty input) - realtime not enabled"
         } else {
             Env-Set 'GEMINI_API_KEY' $geminiKey
             Write-Pass "GEMINI_API_KEY set"
@@ -525,7 +525,7 @@ if ($currentAsrUrl) {
 if ($doConfigure) {
     $asrUrl = Ask-Input "ASR endpoint URL" $currentAsrUrl
     if ([string]::IsNullOrEmpty($asrUrl)) {
-        Write-Fail "PROTEAN_ASR_URL (empty input) — transcription not enabled"
+        Write-Fail "PROTEAN_ASR_URL (empty input) - transcription not enabled"
     } else {
         Env-Set 'PROTEAN_ASR_URL' $asrUrl
         Write-Pass "PROTEAN_ASR_URL=$asrUrl"
@@ -549,7 +549,7 @@ if ($doConfigure) {
                 Env-Set 'PROTEAN_ASR_API_KEY' $asrKey
                 Write-Pass "PROTEAN_ASR_API_KEY set"
             } else {
-                Write-Skip "PROTEAN_ASR_API_KEY (blank — fine for self-hosted)"
+                Write-Skip "PROTEAN_ASR_API_KEY (blank - fine for self-hosted)"
             }
         }
     }

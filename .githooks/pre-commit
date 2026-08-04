@@ -9,3 +9,16 @@ done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.py')
 if [ ${#files[@]} -gt 0 ]; then
   uv run --no-sync ruff check -- "${files[@]}"
 fi
+
+ps1_files=()
+while IFS= read -r -d '' file; do
+  ps1_files+=("$file")
+done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.ps1')
+
+for file in "${ps1_files[@]}"; do
+  non_ascii=$(git show ":$file" | LC_ALL=C tr -d '\000-\177')
+  if [ -n "$non_ascii" ]; then
+    echo "PowerShell scripts must remain ASCII-only: $file" >&2
+    exit 1
+  fi
+done

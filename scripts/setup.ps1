@@ -12,6 +12,7 @@ param()
 
 $ErrorActionPreference = 'Continue'  # collect a final status, don't bail
 $script:Failed = $false
+$script:Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 # ---------- pretty output ------------------------------------------------
 function Write-Step  { param($Msg) Write-Host "`n> $Msg" -ForegroundColor Blue }
@@ -57,7 +58,7 @@ function Ask-Input {
 function Env-Get {
     param([string]$Key)
     if (-not (Test-Path .env)) { return '' }
-    foreach ($line in Get-Content .env) {
+    foreach ($line in [System.IO.File]::ReadAllLines((Resolve-Path .env), $script:Utf8NoBom)) {
         if ($line -match "^\s*$([regex]::Escape($Key))=(.*)$") {
             return $matches[1].Trim().Trim("'").Trim('"')
         }
@@ -67,7 +68,11 @@ function Env-Get {
 
 function Env-Set {
     param([string]$Key, [string]$Value)
-    $lines = if (Test-Path .env) { Get-Content .env } else { @() }
+    $lines = if (Test-Path .env) {
+        [System.IO.File]::ReadAllLines((Resolve-Path .env), $script:Utf8NoBom)
+    } else {
+        @()
+    }
     $found = $false
     $out = foreach ($line in $lines) {
         if ($line -match "^\s*$([regex]::Escape($Key))=") {
@@ -78,10 +83,60 @@ function Env-Set {
         }
     }
     if (-not $found) { $out += "$Key=$Value" }
-    Set-Content -Path .env -Value $out -Encoding UTF8
+    $envPath = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) '.env'))
+    [System.IO.File]::WriteAllLines($envPath, [string[]]$out, $script:Utf8NoBom)
 }
 
 function Test-Cmd { param($Name) [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
+
+function Add-PathEntry {
+    param([string]$Dir, [switch]$PersistUser)
+    if (-not $Dir -or -not (Test-Path $Dir)) { return }
+
+    $pathParts = $env:PATH -split ';' | Where-Object { $_ }
+    if ($pathParts -notcontains $Dir) {
+        $env:PATH = "$Dir;$env:PATH"
+    }
+
+    if ($PersistUser) {
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $userParts = $userPath -split ';' | Where-Object { $_ }
+        if ($userParts -notcontains $Dir) {
+            $newUserPath = if ($userPath) { "$userPath;$Dir" } else { $Dir }
+            [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
+            Write-Warn "added $Dir to User PATH - open a new shell for future sessions"
+        }
+    }
+}
+
+function Refresh-SessionPath {
+    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $parts = @($env:PATH, $machinePath, $userPath) -join ';'
+    $deduped = $parts -split ';' | Where-Object { $_ } | Select-Object -Unique
+    if ($deduped) { $env:PATH = $deduped -join ';' }
+}
+
+function Resolve-FfmpegBin {
+    $roots = @(
+        (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'),
+        (Join-Path $env:USERPROFILE 'Tools'),
+        $env:ProgramFiles,
+        ${env:ProgramFiles(x86)},
+        'C:\ffmpeg'
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    foreach ($root in $roots) {
+        $ffmpeg = Get-ChildItem -Path $root -Filter 'ffmpeg.exe' -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($ffmpeg) {
+            $bin = Split-Path $ffmpeg.FullName
+            if (Test-Path (Join-Path $bin 'ffprobe.exe')) { return $bin }
+        }
+    }
+
+    return $null
+}
 
 function Test-ProteanRepo {
     param([string]$Dir)
@@ -189,13 +244,63 @@ if (Test-Path .env) {
     Write-Fail ".env.example missing — cannot create .env"
 }
 
+# ---------- storage paths ------------------------------------------------
+Write-Step "Configure Protean storage"
+$currentData = Env-Get 'PROTEAN_DATA_DIR'
+$currentSkills = Env-Get 'PROTEAN_SKILLS_DIR'
+$currentRecordings = Env-Get 'PROTEAN_RECORDINGS_DIR'
+$configuredCount = @($currentData, $currentSkills, $currentRecordings).Where({ $_ }).Count
+if ($configuredCount -ne 0 -and $configuredCount -ne 3) {
+    Write-Warn "partial custom storage configuration detected; existing paths were preserved"
+} elseif (-not (Test-Cmd 'uv')) {
+    Write-Skip "uv missing — cannot configure storage"
+} else {
+    $defaultData = Join-Path $RepoRoot 'data'
+    $suggestedData = if ($currentData) { $currentData } else { $defaultData }
+    $selectedData = Ask-Input "Protean data directory" $suggestedData
+    $configureStorage = $true
+    if ($currentData -and $selectedData -eq $currentData) {
+        Write-Pass "storage paths unchanged"
+        Write-Info "Data: $currentData"
+        $configureStorage = $false
+    }
+    if ($configureStorage) {
+        if ([System.IO.Path]::IsPathRooted($selectedData)) {
+            $dataRoot = [System.IO.Path]::GetFullPath($selectedData)
+        } else {
+            $dataRoot = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $selectedData))
+        }
+        & uv run python scripts/configure_storage.py `
+            --repo-root $RepoRoot `
+            --env-file (Join-Path $RepoRoot '.env') `
+            --data-dir $dataRoot `
+            --prompt-migration
+        if ($LASTEXITCODE -eq 0) {
+            Write-Pass "storage configured at $dataRoot"
+        } elseif ($LASTEXITCODE -eq 2) {
+            Write-Skip "storage paths unchanged"
+        } else {
+            Write-Fail "storage migration failed"
+        }
+    }
+}
+
 # ---------- ffmpeg -------------------------------------------------------
 Write-Step "Check ffmpeg (provides ffmpeg + ffprobe)"
+Refresh-SessionPath
+$ffmpegBin = $null
+if (-not ((Test-Cmd 'ffmpeg') -and (Test-Cmd 'ffprobe'))) {
+    $ffmpegBin = Resolve-FfmpegBin
+    if ($ffmpegBin) { Add-PathEntry $ffmpegBin -PersistUser }
+}
+
 if ((Test-Cmd 'ffmpeg') -and (Test-Cmd 'ffprobe')) {
+    if ($ffmpegBin) { Write-Info "found ffmpeg tools at $ffmpegBin" }
     Write-Pass "ffmpeg + ffprobe present"
 } else {
     Write-Fail "ffmpeg / ffprobe missing"
     Write-Info "Install: winget install Gyan.FFmpeg  (or: choco install ffmpeg)"
+    Write-Info "If winget says it is already installed, reopen PowerShell or add the package's bin directory to PATH"
 }
 
 # ---------- node ---------------------------------------------------------

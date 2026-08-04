@@ -51,7 +51,7 @@ def _make_skill(**overrides: Any) -> Skill:
                 name="open-settings",
                 action="Click the Settings button in TestApp.",
                 target_app="TestApp",
-                tool="activate_app(app='TestApp') -> left_click(x=100, y=100)",
+                tool="activate_app(app='TestApp') -> click(x=100, y=100)",
                 verify_condition=VerifyCondition(
                     strategy="ax_element",
                     ax_role="AXButton",
@@ -62,7 +62,7 @@ def _make_skill(**overrides: Any) -> Skill:
                 name="enable-dark-mode",
                 action="Toggle the Dark Mode switch.",
                 target_app="TestApp",
-                tool="screenshot() -> left_click(x=100, y=100)",
+                tool="screenshot() -> click(x=100, y=100)",
                 verify_condition=VerifyCondition(
                     strategy="text_content",
                     expected_text="Dark Mode: On",

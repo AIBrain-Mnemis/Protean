@@ -11,25 +11,47 @@ import sys
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
+MouseButton = Literal["left", "right", "middle"]
+ScrollDirection = Literal["up", "down", "left", "right"]
+
+
 @dataclass(frozen=True)
 class WindowInfo:
-    """Information about the currently active window."""
+    """Information about an application window."""
 
     pid: int
     process_name: str
     window_title: str
+    window_id: str = ""
     bundle_id: str = ""  # macOS bundle identifier
     # Window geometry (logical coordinates)
     x: int = 0
     y: int = 0
     width: int = 0
     height: int = 0
+    app_identifiers: tuple[str, ...] = ()
+
+
+def app_identifier_matches(app: str, identifiers: tuple[str, ...]) -> bool:
+    """Return whether ``app`` exactly matches a stable application identifier."""
+    app_key = app.strip().casefold()
+    return bool(app_key) and app_key in {
+        identifier.casefold() for identifier in identifiers if identifier
+    }
+
+
+def window_matches_app(window: WindowInfo, app: str) -> bool:
+    """Match a window by stable app identity; window titles are never identifiers."""
+    return app_identifier_matches(
+        app,
+        (window.process_name, window.bundle_id, *window.app_identifiers),
+    )
 
 
 @dataclass
@@ -155,7 +177,18 @@ class Platform(Protocol):
         ...
 
     def list_windows(self) -> list[WindowInfo]:
-        """List visible application windows."""
+        """List normal application windows that can be activated by ID.
+
+        Desktop elements, special-purpose windows, fully transparent windows,
+        and windows without usable bounds are excluded.
+        """
+        ...
+
+    def activate_window(self, window_id: str) -> WindowInfo:
+        """Focus a visible window by its platform-provided opaque ID.
+
+        The OS may also raise sibling windows from the same application.
+        """
         ...
 
     def list_notifications(self) -> list[WindowInfo]:
@@ -219,19 +252,38 @@ class Platform(Protocol):
 
     # ── Input simulation (for future skill replay) ──────
 
-    def click(self, x: int, y: int, button: str = "left") -> None:
-        """Simulate a mouse click at logical coordinates."""
-        ...
+    def click(
+        self, x: int, y: int, button: MouseButton = "left", click_count: int = 1,
+    ) -> None:
+        """Simulate a mouse click at logical coordinates.
 
-    def double_click(self, x: int, y: int) -> None:
-        """Simulate a double-click at logical coordinates."""
+        ``click_count`` repeats the press/release pair at the same point
+        with the click-state field set so the OS recognizes it as a
+        multi-click gesture (e.g. ``click_count=2`` for a double-click)
+        rather than two unrelated single clicks.
+        """
         ...
 
     def move_cursor(self, x: int, y: int) -> None:
         """Move the mouse cursor to logical coordinates without clicking."""
         ...
 
-    def scroll(self, x: int, y: int, direction: str = "down", amount: int = 3) -> None:
+    def drag(self, from_x: int, from_y: int, to_x: int, to_y: int) -> None:
+        """Simulate a left-button drag from one point to another.
+
+        Presses at ``(from_x, from_y)``, moves through intermediate
+        points so the OS/app sees a real drag gesture (not a teleport),
+        then releases at ``(to_x, to_y)``.
+        """
+        ...
+
+    def scroll(
+        self,
+        x: int,
+        y: int,
+        direction: ScrollDirection = "down",
+        amount: int = 3,
+    ) -> None:
         """Simulate a scroll event at the given coordinates."""
         ...
 
@@ -390,8 +442,8 @@ class Platform(Protocol):
             unavailable_reason=f"accessibility snapshot is not implemented on {self.name}",
         )
 
-    def activate_app(self, app: str) -> None:
-        """Bring an application to the foreground."""
+    def activate_app(self, app: str) -> WindowInfo:
+        """Bring an application window eligible for ``list_windows`` forward."""
         ...
 
     # ── Notifications ────────────────────────────────────
@@ -564,24 +616,23 @@ class DisplayScale:
 
 
 class CoordinateMapper:
-    """Tracks the active display and maps API coords to screen pixels.
+    """Tracks the selected display and maps API coords to screen pixels.
 
-    Call ``refresh()`` whenever the executor takes a screenshot so the scale
-    follows the user moving windows between monitors. ``to_actual()`` then
-    translates a coord from API space (the screenshot the model sees) to
-    a real screen pixel on the same display.
+    Display selection is explicit. ``select_display()`` changes the coordinate
+    context; screenshot capture and coordinate conversion only consume it.
+    ``to_actual()`` translates a coord from API space (the screenshot the model
+    sees) to a real screen pixel on the selected display.
 
-    The API width is fixed and the API height follows the active display's
+    The API width is fixed and the API height follows the selected display's
     aspect ratio, so screenshots keep the same geometry the user sees.
     """
 
-    def __init__(self, platform: Platform, api_w: int, api_h: int) -> None:
-        self._platform = platform
+    def __init__(self, display: DisplayInfo, api_w: int, api_h: int) -> None:
         self._api_w = api_w
         self._api_h = api_h
-        # Identity scale until refresh() locks onto a display.
         self._scale = DisplayScale(api_w, api_h, api_w, api_h)
-        self._display_index = 1
+        self._display_index = display.display_index
+        self.select_display(display)
 
     @property
     def display_index(self) -> int:
@@ -591,27 +642,34 @@ class CoordinateMapper:
     def scale(self) -> DisplayScale:
         return self._scale
 
-    def refresh(self) -> DisplayInfo | None:
-        """Re-detect the active display and update the scale + origin."""
-        d = active_display(self._platform)
-        if d is None:
-            self._scale = DisplayScale(self._api_w, self._api_h, self._api_w, self._api_h)
-            self._display_index = 1
-            return None
-        api_h = int(round(self._api_w * d.height / d.width))
+    def select_display(self, display: DisplayInfo) -> None:
+        """Set the display used by screenshots and coordinate conversion."""
+        api_h = int(round(self._api_w * display.height / display.width))
         self._scale = DisplayScale(
             api_w=self._api_w,
             api_h=api_h,
-            actual_w=d.width,
-            actual_h=d.height,
-            origin_x=d.origin_x,
-            origin_y=d.origin_y,
+            actual_w=display.width,
+            actual_h=display.height,
+            origin_x=display.origin_x,
+            origin_y=display.origin_y,
         )
-        self._display_index = d.display_index
-        return d
+        self._display_index = display.display_index
 
     def to_actual(self, x: int, y: int) -> tuple[int, int]:
         return self._scale.to_actual(x, y)
+
+    def to_actual_on(self, display: DisplayInfo, x: int, y: int) -> tuple[int, int]:
+        """Map API coordinates onto a display without selecting it."""
+        api_h = int(round(self._api_w * display.height / display.width))
+        scale = DisplayScale(
+            api_w=self._api_w,
+            api_h=api_h,
+            actual_w=display.width,
+            actual_h=display.height,
+            origin_x=display.origin_x,
+            origin_y=display.origin_y,
+        )
+        return scale.to_actual(x, y)
 
     def to_api(self, actual_x: int, actual_y: int) -> tuple[int, int]:
         return self._scale.to_api(actual_x, actual_y)

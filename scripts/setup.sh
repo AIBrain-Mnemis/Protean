@@ -110,6 +110,68 @@ env_set() {
   mv "$tmp" .env
 }
 
+add_path_entry() {
+  local dir="$1"
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) PATH="$dir:$PATH"; export PATH ;;
+  esac
+}
+
+windows_path_to_unix() {
+  local p="$1"
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -u "$p" 2>/dev/null || printf "%s" "$p"
+  else
+    printf "%s" "$p"
+  fi
+}
+
+find_ffmpeg_bin() {
+  local dir root found
+  for dir in \
+    /opt/homebrew/bin \
+    /usr/local/bin \
+    /opt/local/bin \
+    /usr/bin \
+    /snap/bin \
+    "$HOME/.local/bin" \
+    "$HOME/Tools/ffmpeg/bin" \
+    /c/ffmpeg/bin
+  do
+    if { [ -x "$dir/ffmpeg" ] || [ -x "$dir/ffmpeg.exe" ]; } && \
+       { [ -x "$dir/ffprobe" ] || [ -x "$dir/ffprobe.exe" ]; }; then
+      printf "%s" "$dir"
+      return 0
+    fi
+  done
+
+  case "$OS" in
+    MINGW*|MSYS*|CYGWIN*)
+      for root in \
+        "${LOCALAPPDATA:-}/Microsoft/WinGet/Packages" \
+        "${USERPROFILE:-}/Tools" \
+        "C:/ffmpeg" \
+        "C:/Program Files" \
+        "C:/Program Files (x86)"
+      do
+        [ -n "$root" ] || continue
+        root="$(windows_path_to_unix "$root")"
+        [ -d "$root" ] || continue
+        found="$(find "$root" -type f -name ffmpeg.exe -print -quit 2>/dev/null || true)"
+        [ -n "$found" ] || continue
+        dir="$(dirname "$found")"
+        [ -x "$dir/ffprobe.exe" ] || continue
+        printf "%s" "$dir"
+        return 0
+      done
+      ;;
+  esac
+
+  return 1
+}
+
 # ---------- locate or clone repo ----------------------------------------
 # A "protean repo" is a directory whose pyproject.toml declares name="protean".
 # When the script lives inside such a repo (normal case: user already cloned),
@@ -222,8 +284,55 @@ else
   fail ".env.example missing — cannot create .env"
 fi
 
+# ---------- storage paths ------------------------------------------------
+step "Configure Protean storage"
+current_data="$(env_get PROTEAN_DATA_DIR)"
+current_skills="$(env_get PROTEAN_SKILLS_DIR)"
+current_recordings="$(env_get PROTEAN_RECORDINGS_DIR)"
+configured_count=0
+[ -n "$current_data" ] && configured_count=$((configured_count + 1))
+[ -n "$current_skills" ] && configured_count=$((configured_count + 1))
+[ -n "$current_recordings" ] && configured_count=$((configured_count + 1))
+if [ "$configured_count" -ne 0 ] && [ "$configured_count" -ne 3 ]; then
+  warn "partial custom storage configuration detected; existing paths were preserved"
+elif ! command -v uv >/dev/null 2>&1; then
+  skip "uv missing — cannot configure storage"
+else
+  default_data="$REPO_ROOT/data"
+  suggested_data="${current_data:-$default_data}"
+  selected_data="$(ask_input "Protean data directory" "$suggested_data")"
+  if [ -n "$current_data" ] && [ "$selected_data" = "$current_data" ]; then
+    pass "storage paths unchanged"
+    info "Data: $current_data"
+  else
+    case "$selected_data" in
+      /*) data_root="$selected_data" ;;
+      *)  data_root="$REPO_ROOT/$selected_data" ;;
+    esac
+    uv run python scripts/configure_storage.py \
+        --repo-root "$REPO_ROOT" \
+        --env-file "$REPO_ROOT/.env" \
+        --data-dir "$data_root" \
+        --prompt-migration
+    storage_status=$?
+    case "$storage_status" in
+      0) pass "storage configured at $data_root" ;;
+      2) skip "storage paths unchanged" ;;
+      *) fail "storage migration failed" ;;
+    esac
+  fi
+fi
+
 # ---------- ffmpeg -------------------------------------------------------
 step "Check ffmpeg (provides ffmpeg + ffprobe)"
+if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+  ffmpeg_bin="$(find_ffmpeg_bin || true)"
+  if [ -n "$ffmpeg_bin" ]; then
+    add_path_entry "$ffmpeg_bin"
+    info "found ffmpeg tools at $ffmpeg_bin"
+  fi
+fi
+
 if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
   pass "ffmpeg + ffprobe present"
 else
@@ -231,6 +340,7 @@ else
   case "$OS" in
     Darwin)  info "Install: brew install ffmpeg" ;;
     Linux)   info "Install: sudo apt install ffmpeg  (or distro equivalent)" ;;
+    MINGW*|MSYS*|CYGWIN*) info "Install: winget install Gyan.FFmpeg  (or add its bin directory to PATH)" ;;
     *)       info "Install ffmpeg for your platform" ;;
   esac
 fi

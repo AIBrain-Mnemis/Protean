@@ -14,8 +14,9 @@ Tool definitions come from ``GUI_TOOL_SPECS`` in
 ``protean.executor.actions``: this module is purely the MCP
 wire-format adapter (``ActionResult`` → MCP content blocks) plus
 error wrapping. ``ActionExecutor`` propagates ``Platform`` exceptions;
-we catch here and produce ``"<Action> failed: {e}"`` text with
-``is_error=True``, matching the legacy MCP behavior.
+we catch here and format them with ``format_tool_error()`` (the same
+schema + hint text the native computer-use loop gives the model) with
+``is_error=True``.
 
 Platform methods are called directly (not via asyncio.to_thread) because
 Windows UIA uses COM objects that are apartment-threaded — calling them
@@ -25,7 +26,7 @@ from a thread-pool thread causes deadlocks.
 from __future__ import annotations
 
 import logging
-from typing import Annotated, Any
+from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
@@ -34,12 +35,14 @@ from protean.executor.actions import (
     ActionExecutor,
     ActionResult,
     ToolSpec,
+    format_tool_error,
 )
 from protean.platform.base import (
     LLM_SCREENSHOT_HEIGHT,
     LLM_SCREENSHOT_WIDTH,
     CoordinateMapper,
     Platform,
+    active_display,
 )
 
 log = logging.getLogger(__name__)
@@ -72,32 +75,6 @@ def _error(message: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": message}], "is_error": True}
 
 
-# JSON schema type → Python type for ``Annotated`` params expected by
-# claude_agent_sdk's ``@tool`` decorator.
-_JSON_TYPE_TO_PY: dict[str, type] = {
-    "integer": int,
-    "number": float,
-    "string": str,
-    "boolean": bool,
-}
-
-
-def _spec_to_annotated_schema(spec: ToolSpec) -> dict[str, Any]:
-    """Convert a ``ToolSpec``'s JSON schema to ``@tool``-style Annotated dict.
-
-    claude_agent_sdk's ``@tool`` wants ``{param: Annotated[type, desc]}``
-    rather than a raw JSON schema; this is the bridge so the same
-    ``GUI_TOOL_SPECS`` source feeds both Anthropic/OpenAI function
-    tools (raw schema) and the MCP server (Annotated form).
-    """
-    props = spec.input_schema.get("properties", {})
-    schema: dict[str, Any] = {}
-    for param_name, prop in props.items():
-        py_type = _JSON_TYPE_TO_PY.get(prop.get("type", "string"), str)
-        schema[param_name] = Annotated[py_type, prop.get("description", "")]
-    return schema
-
-
 def build_mcp_server(platform: Platform) -> Any:
     """Build an in-process MCP server wrapping Platform GUI methods.
 
@@ -112,7 +89,10 @@ def build_mcp_server(platform: Platform) -> Any:
     adding a new GUI action in ``protean.executor.actions`` exposes
     it through MCP with no edits to this file.
     """
-    mapper = CoordinateMapper(platform, LLM_SCREENSHOT_WIDTH, LLM_SCREENSHOT_HEIGHT)
+    display = active_display(platform)
+    if display is None:
+        raise RuntimeError("No display is available")
+    mapper = CoordinateMapper(display, LLM_SCREENSHOT_WIDTH, LLM_SCREENSHOT_HEIGHT)
     actions = ActionExecutor(platform, mapper)
 
     all_tools = [_register_gui_tool(actions, spec) for spec in GUI_TOOL_SPECS]
@@ -137,11 +117,18 @@ def _register_gui_tool(actions: ActionExecutor, spec: ToolSpec) -> Any:
     the loop variable's final value).
     """
 
-    @tool(spec.name, spec.description, _spec_to_annotated_schema(spec))
+    @tool(spec.name, spec.description, spec.input_schema)
     async def handler(args: dict[str, Any]) -> dict[str, Any]:
         try:
-            return result_to_mcp(await actions.dispatch(spec.name, args))
+            # ``include_screenshot`` is a batching hint from the calling
+            # agent (see GUI_TOOL_SPECS), not a Platform action arg — pull
+            # it out before dispatch instead of leaving it in the payload.
+            include_screenshot = bool(args.pop("include_screenshot", True))
+            result = await actions.dispatch(
+                spec.name, args, include_screenshot=include_screenshot,
+            )
+            return result_to_mcp(result)
         except Exception as e:
-            return _error(f"{spec.name} failed: {e}")
+            return _error(format_tool_error(spec.name, args, spec.input_schema, e))
 
     return handler

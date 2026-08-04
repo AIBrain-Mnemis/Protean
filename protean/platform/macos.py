@@ -32,6 +32,7 @@ from AppKit import (
 )
 from ApplicationServices import (
     AXIsProcessTrustedWithOptions,
+    AXUIElementCopyActionNames,
     AXUIElementCopyAttributeValue,
     AXUIElementCopyElementAtPosition,
     AXUIElementCreateApplication,
@@ -40,7 +41,7 @@ from ApplicationServices import (
     AXUIElementSetAttributeValue,
 )
 from CoreFoundation import kCFBooleanTrue
-from Foundation import NSArray
+from Foundation import NSArray, NSBundle
 from Quartz import (
     CFMachPortCreateRunLoopSource,
     CFRunLoopAddSource,
@@ -71,13 +72,17 @@ from Quartz import (
     kCGEventFlagMaskShift,
     kCGEventKeyDown,
     kCGEventLeftMouseDown,
+    kCGEventLeftMouseDragged,
     kCGEventLeftMouseUp,
     kCGEventMouseMoved,
+    kCGEventOtherMouseDown,
+    kCGEventOtherMouseUp,
     kCGEventRightMouseDown,
     kCGEventRightMouseUp,
     kCGHeadInsertEventTap,
     kCGHIDEventTap,
     kCGKeyboardEventKeycode,
+    kCGMouseButtonCenter,
     kCGMouseButtonLeft,
     kCGMouseButtonRight,
     kCGMouseEventClickState,
@@ -94,9 +99,12 @@ from protean.platform.base import (
     ClipboardContent,
     DisplayInfo,
     ElementInfo,
+    MouseButton,
     Platform,
     Rect,
+    ScrollDirection,
     WindowInfo,
+    app_identifier_matches,
 )
 
 log = logging.getLogger(__name__)
@@ -212,6 +220,8 @@ class MacOSPlatform(Platform):
         window_list = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
 
         for win in window_list:
+            if float(win.get("kCGWindowAlpha", 1.0)) <= 0:
+                continue
             bounds = win.get("kCGWindowBounds", {})
             wx = int(bounds.get("X", 0))
             wy = int(bounds.get("Y", 0))
@@ -228,6 +238,7 @@ class MacOSPlatform(Platform):
                     pid=pid,
                     process_name=win.get("kCGWindowOwnerName", ""),
                     window_title=win.get("kCGWindowName", ""),
+                    window_id=str(win.get("kCGWindowNumber", "")),
                     bundle_id=self._bundle_id_for_pid(pid),
                     x=wx,
                     y=wy,
@@ -255,51 +266,208 @@ class MacOSPlatform(Platform):
         app_name = active_app.get("NSApplicationName", "")
         bundle_id = active_app.get("NSApplicationBundleIdentifier", "")
 
-        # Find the frontmost window for this pid (search all layers, not just 0)
-        options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
-        window_list = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+        windows = self._visible_cg_windows(pid)
+        focused_rect = self._focused_ax_window_rect(pid)
+        if focused_rect is not None:
+            matches = [win for win in windows if self._cg_window_rect(win) == focused_rect]
+            if len(matches) == 1:
+                return self._window_info(matches[0], bundle_id=bundle_id)
 
-        for win in window_list:
-            if win.get("kCGWindowOwnerPID") == pid:
-                bounds = win.get("kCGWindowBounds", {})
-                ww = int(bounds.get("Width", 0))
-                wh = int(bounds.get("Height", 0))
-                # Skip tiny / zero-size windows
-                if ww < 2 or wh < 2:
-                    continue
-                return WindowInfo(
-                    pid=pid,
-                    process_name=app_name,
-                    window_title=win.get("kCGWindowName", ""),
-                    bundle_id=bundle_id,
-                    x=int(bounds.get("X", 0)),
-                    y=int(bounds.get("Y", 0)),
-                    width=ww,
-                    height=wh,
-                )
+        if windows:
+            return self._window_info(windows[0], bundle_id=bundle_id)
 
         return WindowInfo(pid=pid, process_name=app_name, window_title="", bundle_id=bundle_id)
 
     def list_windows(self) -> list[WindowInfo]:
-        options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
-        window_list = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
-        results = []
-        for win in window_list:
-            if win.get("kCGWindowLayer", 999) != 0:
+        self._ensure_accessibility()
+        results: list[WindowInfo] = []
+        for win in self._visible_cg_windows():
+            pid = int(win.get("kCGWindowOwnerPID", 0))
+            bundle_id = self._bundle_id_for_pid(pid)
+            if not bundle_id:
                 continue
-            bounds = win.get("kCGWindowBounds", {})
-            results.append(
-                WindowInfo(
-                    pid=win.get("kCGWindowOwnerPID", 0),
-                    process_name=win.get("kCGWindowOwnerName", ""),
-                    window_title=win.get("kCGWindowName", ""),
-                    x=int(bounds.get("X", 0)),
-                    y=int(bounds.get("Y", 0)),
-                    width=int(bounds.get("Width", 0)),
-                    height=int(bounds.get("Height", 0)),
-                )
-            )
+            rect = self._cg_window_rect(win)
+            if not self._cg_rect_is_unique(pid, rect):
+                continue
+            if self._ax_window_for_rect(pid, rect) is None:
+                continue
+            results.append(self._window_info(win, bundle_id=bundle_id))
         return results
+
+    def activate_window(self, window_id: str) -> WindowInfo:
+        self._ensure_accessibility()
+        try:
+            target_id = int(window_id)
+        except ValueError as error:
+            raise ValueError(f"Invalid macOS window ID: {window_id!r}") from error
+
+        matches = [
+            win
+            for win in self._visible_cg_windows()
+            if int(win.get("kCGWindowNumber", 0)) == target_id
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(f"Window {window_id!r} is not visible")
+        target = matches[0]
+        pid = int(target.get("kCGWindowOwnerPID", 0))
+        target_rect = self._cg_window_rect(target)
+        if not self._cg_rect_is_unique(pid, target_rect):
+            raise RuntimeError(f"Window {window_id!r} is not uniquely addressable")
+        ax_window = self._ax_window_for_rect(pid, target_rect)
+        if ax_window is None:
+            raise RuntimeError(f"Window {window_id!r} is not uniquely addressable")
+
+        self._activate_pid(pid)
+        error = AXUIElementPerformAction(ax_window, "AXRaise")
+        if error != 0:
+            raise RuntimeError(f"AXRaise failed for window {window_id!r}: {error}")
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            active = self.get_active_window()
+            if active is not None and active.window_id == window_id:
+                return active
+            time.sleep(0.05)
+        actual = self.get_active_window()
+        raise RuntimeError(
+            f"Window {window_id!r} did not become active; active window is {actual}"
+        )
+
+    @staticmethod
+    def _cg_window_rect(win: dict) -> tuple[int, int, int, int]:
+        bounds = win.get("kCGWindowBounds", {})
+        return (
+            int(bounds.get("X", 0)),
+            int(bounds.get("Y", 0)),
+            int(bounds.get("Width", 0)),
+            int(bounds.get("Height", 0)),
+        )
+
+    def _visible_cg_windows(self, pid: int | None = None) -> list[dict]:
+        options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
+        windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+        results: list[dict] = []
+        for win in windows:
+            if pid is not None and int(win.get("kCGWindowOwnerPID", 0)) != pid:
+                continue
+            if int(win.get("kCGWindowLayer", 999)) != 0:
+                continue
+            if float(win.get("kCGWindowAlpha", 1.0)) <= 0:
+                continue
+            _, _, width, height = self._cg_window_rect(win)
+            if width < 2 or height < 2:
+                continue
+            results.append(win)
+        return results
+
+    def _cg_rect_is_unique(self, pid: int, rect: tuple[int, int, int, int]) -> bool:
+        return sum(
+            self._cg_window_rect(win) == rect
+            for win in self._visible_cg_windows(pid)
+        ) == 1
+
+    def _ax_window_for_rect(self, pid: int, rect: tuple[int, int, int, int]):
+        app_ref = AXUIElementCreateApplication(pid)
+        try:
+            error, windows = AXUIElementCopyAttributeValue(app_ref, "AXWindows", None)
+        except Exception:
+            return None
+        if error != 0 or not windows:
+            return None
+
+        matches = []
+        for window in windows:
+            try:
+                error, role = AXUIElementCopyAttributeValue(window, "AXRole", None)
+                if error != 0 or role != "AXWindow":
+                    continue
+                error, minimized = AXUIElementCopyAttributeValue(window, "AXMinimized", None)
+                if error == 0 and bool(minimized):
+                    continue
+                error, position = AXUIElementCopyAttributeValue(window, "AXPosition", None)
+                if error != 0:
+                    continue
+                error, size = AXUIElementCopyAttributeValue(window, "AXSize", None)
+                if error != 0:
+                    continue
+                point = _extract_ax_point(position)
+                dimensions = _extract_ax_size(size)
+                px, py = point
+                width, height = dimensions
+                if px is None or py is None or width is None or height is None:
+                    continue
+                window_rect = (int(px), int(py), int(width), int(height))
+                if window_rect != rect:
+                    continue
+                error, actions = AXUIElementCopyActionNames(window, None)
+                if error == 0 and "AXRaise" in (actions or []):
+                    matches.append(window)
+            except Exception:
+                continue
+        return matches[0] if len(matches) == 1 else None
+
+    def _focused_ax_window_rect(self, pid: int) -> tuple[int, int, int, int] | None:
+        app_ref = AXUIElementCreateApplication(pid)
+        try:
+            error, window = AXUIElementCopyAttributeValue(app_ref, "AXFocusedWindow", None)
+            if error != 0 or window is None:
+                return None
+            error, position = AXUIElementCopyAttributeValue(window, "AXPosition", None)
+            if error != 0:
+                return None
+            error, size = AXUIElementCopyAttributeValue(window, "AXSize", None)
+            if error != 0:
+                return None
+        except Exception:
+            return None
+        point = _extract_ax_point(position)
+        dimensions = _extract_ax_size(size)
+        px, py = point
+        width, height = dimensions
+        if px is None or py is None or width is None or height is None:
+            return None
+        return int(px), int(py), int(width), int(height)
+
+    def _window_info(self, win: dict, *, bundle_id: str) -> WindowInfo:
+        x, y, width, height = self._cg_window_rect(win)
+        pid = int(win.get("kCGWindowOwnerPID", 0))
+        return WindowInfo(
+            pid=pid,
+            process_name=str(win.get("kCGWindowOwnerName", "")),
+            window_title=str(win.get("kCGWindowName", "")),
+            window_id=str(win.get("kCGWindowNumber", "")),
+            bundle_id=bundle_id,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            app_identifiers=self._running_app_identifiers(
+                NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+            ),
+        )
+
+    def _activate_pid(self, pid: int) -> None:
+        script = (
+            'tell application "System Events" to set frontmost of '
+            f'(first application process whose unix id is {pid}) to true'
+        )
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"Application PID {pid} could not be activated: {detail}")
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            active = NSWorkspace.sharedWorkspace().activeApplication()
+            if active and int(active["NSApplicationProcessIdentifier"]) == pid:
+                return
+            time.sleep(0.05)
+        raise RuntimeError(f"Application PID {pid} did not become active")
 
     def list_notifications(self) -> list[WindowInfo]:
         """List notification/overlay windows (non-layer-0)."""
@@ -319,6 +487,7 @@ class MacOSPlatform(Platform):
                     pid=win.get("kCGWindowOwnerPID", 0),
                     process_name=win.get("kCGWindowOwnerName", ""),
                     window_title=win.get("kCGWindowName", ""),
+                    window_id=str(win.get("kCGWindowNumber", "")),
                     x=int(bounds.get("X", 0)),
                     y=int(bounds.get("Y", 0)),
                     width=int(bounds.get("Width", 0)),
@@ -536,44 +705,62 @@ class MacOSPlatform(Platform):
 
     # ── Input simulation ─────────────────────────────────
 
-    def click(self, x: int, y: int, button: str = "left") -> None:
+    def click(
+        self, x: int, y: int, button: MouseButton = "left", click_count: int = 1,
+    ) -> None:
         point = CGPointMake(x, y)
         if button == "right":
-            down = CGEventCreateMouseEvent(
-                None, kCGEventRightMouseDown, point, kCGMouseButtonRight,
+            down_type, up_type, button_const = (
+                kCGEventRightMouseDown, kCGEventRightMouseUp, kCGMouseButtonRight,
             )
-            up = CGEventCreateMouseEvent(
-                None, kCGEventRightMouseUp, point, kCGMouseButtonRight,
+        elif button == "middle":
+            down_type, up_type, button_const = (
+                kCGEventOtherMouseDown, kCGEventOtherMouseUp, kCGMouseButtonCenter,
             )
         else:
-            down = CGEventCreateMouseEvent(
-                None, kCGEventLeftMouseDown, point, kCGMouseButtonLeft,
+            down_type, up_type, button_const = (
+                kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGMouseButtonLeft,
             )
-            up = CGEventCreateMouseEvent(
-                None, kCGEventLeftMouseUp, point, kCGMouseButtonLeft,
-            )
+        for click_state in range(1, click_count + 1):
+            down = CGEventCreateMouseEvent(None, down_type, point, button_const)
+            CGEventSetIntegerValueField(down, kCGMouseEventClickState, click_state)
+            up = CGEventCreateMouseEvent(None, up_type, point, button_const)
+            CGEventSetIntegerValueField(up, kCGMouseEventClickState, click_state)
+            CGEventPost(kCGHIDEventTap, down)
+            CGEventPost(kCGHIDEventTap, up)
+
+    def drag(self, from_x: int, from_y: int, to_x: int, to_y: int) -> None:
+        """Drag from one point to another using CGEvent mouse-down/dragged/up.
+
+        Posts intermediate ``kCGEventLeftMouseDragged`` events along the
+        path so apps that track drag position (drop-target highlighting,
+        outline/table reordering) see a real gesture instead of a jump.
+        """
+        down = CGEventCreateMouseEvent(
+            None, kCGEventLeftMouseDown, CGPointMake(from_x, from_y), kCGMouseButtonLeft,
+        )
         CGEventPost(kCGHIDEventTap, down)
+        steps = 10
+        for step in range(1, steps + 1):
+            ix = from_x + (to_x - from_x) * step // steps
+            iy = from_y + (to_y - from_y) * step // steps
+            dragged = CGEventCreateMouseEvent(
+                None, kCGEventLeftMouseDragged, CGPointMake(ix, iy), kCGMouseButtonLeft,
+            )
+            CGEventPost(kCGHIDEventTap, dragged)
+            time.sleep(0.01)
+        up = CGEventCreateMouseEvent(
+            None, kCGEventLeftMouseUp, CGPointMake(to_x, to_y), kCGMouseButtonLeft,
+        )
         CGEventPost(kCGHIDEventTap, up)
 
-    def double_click(self, x: int, y: int) -> None:
-        """Double-click at (x, y) using CGEvent with clickCount=2."""
-        point = CGPointMake(x, y)
-        # First click
-        down1 = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, point, kCGMouseButtonLeft)
-        CGEventSetIntegerValueField(down1, kCGMouseEventClickState, 1)
-        up1 = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, point, kCGMouseButtonLeft)
-        CGEventSetIntegerValueField(up1, kCGMouseEventClickState, 1)
-        # Second click
-        down2 = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, point, kCGMouseButtonLeft)
-        CGEventSetIntegerValueField(down2, kCGMouseEventClickState, 2)
-        up2 = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, point, kCGMouseButtonLeft)
-        CGEventSetIntegerValueField(up2, kCGMouseEventClickState, 2)
-        CGEventPost(kCGHIDEventTap, down1)
-        CGEventPost(kCGHIDEventTap, up1)
-        CGEventPost(kCGHIDEventTap, down2)
-        CGEventPost(kCGHIDEventTap, up2)
-
-    def scroll(self, x: int, y: int, direction: str = "down", amount: int = 3) -> None:
+    def scroll(
+        self,
+        x: int,
+        y: int,
+        direction: ScrollDirection = "down",
+        amount: int = 3,
+    ) -> None:
         """Scroll at (x, y). direction: up/down/left/right."""
         # Move cursor to position first
         self.move_cursor(x, y)
@@ -583,9 +770,9 @@ class MacOSPlatform(Platform):
         elif direction == "up":
             dy = amount
         elif direction == "right":
-            dx = -amount
-        elif direction == "left":
             dx = amount
+        elif direction == "left":
+            dx = -amount
         scroll_event = CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitLine, 2, dy, dx)
         CGEventPost(kCGHIDEventTap, scroll_event)
 
@@ -1673,12 +1860,113 @@ class MacOSPlatform(Platform):
 
         return results
 
-    def activate_app(self, app: str) -> None:
-        """Bring an application to the foreground via AppleScript."""
-        subprocess.run(
-            ["osascript", "-e", f'tell application "{_escape_applescript(app)}" to activate'],
-            capture_output=True, timeout=5,
+    def activate_app(self, app: str) -> WindowInfo:
+        """Bring an application to the foreground, launching it if needed."""
+        running = self._find_running_app(app)
+        if running is not None:
+            pid = running.processIdentifier()
+            bundle_id = running.bundleIdentifier() or ""
+            if not bundle_id:
+                raise RuntimeError(f"Application {app!r} has no bundle identifier")
+            result = subprocess.run(
+                ["open", "-b", bundle_id],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                detail = result.stderr.strip() or f"exit code {result.returncode}"
+                raise RuntimeError(f"Application {app!r} could not be activated: {detail}")
+            return self._wait_for_app_window(app, pid=pid, bundle_id=bundle_id)
+
+        app_path, bundle_id = self._resolve_application(app)
+        result = subprocess.run(
+            ["open", app_path],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"Application {app!r} could not be activated: {detail}")
+
+        return self._wait_for_app_window(app, bundle_id=bundle_id)
+
+    def _wait_for_app_window(
+        self,
+        app: str,
+        *,
+        pid: int | None = None,
+        bundle_id: str = "",
+    ) -> WindowInfo:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            window = self.get_active_window()
+            if (
+                window is not None
+                and (pid is None or window.pid == pid)
+                and (not bundle_id or window.bundle_id == bundle_id)
+                and window.window_id
+                and window.width > 0
+                and window.height > 0
+            ):
+                return window
+            time.sleep(0.05)
+        actual = self.get_active_window()
+        raise RuntimeError(
+            f"Application {app!r} did not become active; active window is {actual}"
+        )
+
+    def _find_running_app(self, app: str):
+        for item in NSWorkspace.sharedWorkspace().runningApplications():
+            if app_identifier_matches(app, self._running_app_identifiers(item)):
+                return item
+        return None
+
+    @staticmethod
+    def _running_app_identifiers(item) -> tuple[str, ...]:
+        if item is None:
+            return ()
+        identifiers = [item.localizedName() or "", item.bundleIdentifier() or ""]
+        executable_url = item.executableURL()
+        bundle_url = item.bundleURL()
+        if executable_url is not None:
+            executable = Path(executable_url.path())
+            identifiers.extend((executable.stem, executable.name))
+        if bundle_url is not None:
+            bundle = Path(bundle_url.path())
+            identifiers.extend((bundle.stem, bundle.name))
+        return tuple(dict.fromkeys(identifier for identifier in identifiers if identifier))
+
+    def _resolve_application(self, app: str) -> tuple[str, str]:
+        workspace = NSWorkspace.sharedWorkspace()
+        url = workspace.URLForApplicationWithBundleIdentifier_(app)
+        path = url.path() if url is not None else workspace.fullPathForApplication_(app)
+        if path is None:
+            escaped = app.replace("\\", "\\\\").replace("'", "\\'")
+            query = (
+                "kMDItemContentType == 'com.apple.application-bundle' && "
+                f"(kMDItemDisplayName == '{escaped}'c || "
+                f"kMDItemFSName == '{escaped}.app'c)"
+            )
+            result = subprocess.run(
+                ["mdfind", query], capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                detail = result.stderr.strip() or f"exit code {result.returncode}"
+                raise RuntimeError(f"Application {app!r} could not be resolved: {detail}")
+            matches = [line for line in result.stdout.splitlines() if line]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"Application {app!r} resolved to {len(matches)} app bundles"
+                )
+            path = matches[0]
+
+        bundle = NSBundle.bundleWithPath_(path)
+        bundle_id = bundle.bundleIdentifier() if bundle is not None else ""
+        if not bundle_id:
+            raise RuntimeError(f"Application {app!r} has no bundle identifier")
+        return path, bundle_id
 
     def _find_process_name(self, app_name: str) -> str | None:
         """Find the System Events process name for an app."""

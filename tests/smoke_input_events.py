@@ -411,7 +411,7 @@ def test_mouse(platform, listener: InputListener, report: Report) -> None:
 
     # double_click — expect two left-press events
     listener.clear()
-    platform.double_click(cx, cy)
+    platform.click(cx, cy, "left", click_count=2)
     clicks = [
         e for e in listener.read_mouse(wait=0.5)
         if isinstance(e, MouseClickEvent) and e.button == "left" and e.pressed

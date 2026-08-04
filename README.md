@@ -67,7 +67,7 @@ Today Protean ships the desktop-automation slice of that vision end-to-end:
   Linux (stub).
 - **Multi-provider LLM**: OpenAI, Anthropic, Gemini, and Doubao (Ark) for
   offline skill generation.
-- **Cross-platform tool suite**: `screenshot`, `click`, `click_at`,
+- **Cross-platform tool suite**: `screenshot`, `click`, `drag`,
   `type_text`, `key_press`, `activate_app`, `select_option` — driven
   directly by `computer_use` (default), or exposed to external CLI
   agents (`claude_code` via `-E claude_code`) through the in-process
@@ -431,7 +431,6 @@ Things known to be incomplete:
   stub.
 - **Cross-run skill evolution.** Aggregating trajectories across many runs to
   evolve a skill more aggressively than per-run `refine()`.
-- **Drag toolkit function** — `drag(app, from_label, to_label)`.
 
 ## Development
 

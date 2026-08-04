@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from textwrap import dedent
 
+from protean.executor.providers.prompts.batching import BATCHING_GUIDANCE
 from protean.skills.schema import Skill, SkillParameter, Step
 
 AGENT_PROTEAN_SKILL_NAME = "build-and-evolve-skills-with-protean"
@@ -130,7 +131,7 @@ def build_and_evolve_skills_with_protean_skill(
         """
     ).strip()
     platform_tools = dedent(
-        """
+      f"""
         Tool surfaces available alongside your runtime's native tools:
 
         - **Protean MCP** (`mcp__protean__*`): coordinate-driven desktop control
@@ -141,6 +142,13 @@ def build_and_evolve_skills_with_protean_skill(
           trajectory lifecycle that has no other entry point — `skills list /
           show / run`, `record`, `generate`, `daemon`, `trajectories
           mark / inspect / evolve`.
+
+        - **Batching policy for `mcp__protean__*`**:
+          For MCP routes, pass `include_screenshot: false` on every call in the
+          batch except the last call; only the final action should return the
+          screenshot that confirms outcome.
+
+        {BATCHING_GUIDANCE}
         """
     ).strip()
 

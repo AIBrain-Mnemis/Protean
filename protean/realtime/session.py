@@ -506,7 +506,7 @@ class TeachSession:
             extra["display_routing"] = (
                 f"The user is watching display {n}. To keep your view aligned "
                 f"with theirs, activate the target app and use the screenshot "
-                f"returned by activate_app for left_click, mouse_move, or scroll "
+                f"returned by activate_app for click, drag, mouse_move, or scroll "
                 f"coordinates. Keyboard and clipboard tools are "
                 f"scoped by the focused element and need no display routing."
             )
@@ -573,7 +573,7 @@ class TeachSession:
             label = self._active_share_label or "unknown surface"
             display_hint = (
                 " Activate the target app and use the screenshot returned by "
-                "activate_app for left_click, mouse_move, or scroll "
+                "activate_app for click, drag, mouse_move, or scroll "
                 "coordinates so your view and actions match the user's display."
                 if (
                     self._active_share_mode == "share"
